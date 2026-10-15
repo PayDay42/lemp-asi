@@ -1,14 +1,17 @@
 // mp_menu — loads the main menu's Multiplayer screen when its entry is pressed.
 //
 // NOT A PROBE. THIS ASI WRITES TO GAME MEMORY, like mp_save and join_patch:
-// one UFunction::Func pointer, SFXGUI_MainMenu_RTT.CallListFnc's (native).
+// one UFunction::Func pointer, SFXGUI_MainMenu_RTT.CallListFnc's (native), and
+// the Multiplayer entry's FncOnSelect text in the live menu's ListEntries
+// (ShowDemoLoginPopup -> ShowGameManual, in place; RewriteSelect).
 // In debug mode it writes one log of its own, mp_menu_<pid>_<tick>.txt in
 // Documents\BioWare\Mass Effect Legendary Edition\LEMP\logs (lemp.h).
 //
 // ---------------------------------------------------------------------------
 // Why it exists
 //
-// The Multiplayer entry (DLC config) calls ShowGameManual, which opens movie
+// The Multiplayer entry (DLC config; ShowGameManual once RewriteSelect has
+// renamed it) calls ShowGameManual, which opens movie
 // tag 'Manual', which the DLC points at MPMainMenu.SFXGUI_MPMainMenuEntry
 // (MPMainMenu.pcc). The native OpenMovie does NOT load a class that is not in
 // memory [V], and on the main menu after a fresh boot nothing of the DLC is:
@@ -44,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 
 static const uintptr_t RVA_NAME_POOLS = 0x17B33D0;   // as repl_probe / mp_save
@@ -191,6 +195,62 @@ static void RootClass() {
     }
 }
 
+// The entry the DLC ships calls LE3's ShowDemoLoginPopup: a message box whose
+// text the DLC sets to "Multiplayer needs lemp.asi ..." (string 935840), what a
+// player without this ASI gets, since nothing of the DLC is loaded at the main
+// menu then. With the ASI it must open the Multiplayer
+// screen: so its FncOnSelect is rewritten to ShowGameManual (the path above) in
+// the live menu's own ListEntries, before the original runs. In place: the old
+// text is longer, so the new one and its terminator fit in its buffer and only
+// the count changes (nothing allocated or freed). ShowList re-sends the entries
+// to the movie on every list refresh, which picks the new name up [R: the list
+// refreshes every ListUpdateInterval, 3 s; a list shown before the hook went in
+// keeps the old name until then].
+// ListEntries at 0x37C (LExSDK SFXGame_classes.h), an array of FMMListEntry
+// (0x58: ListID, FncOnSelect, FncActiveConditional, ...; SFXGame_structs.h);
+// checked by content, else left alone and logged once.
+static const size_t OFF_RTT_LISTENTRIES = 0x37C;
+static const size_t MMLISTENTRY_SIZE = 0x58, OFF_MM_LISTID = 0x00, OFF_MM_FNCONSELECT = 0x10, OFF_MM_FNCACTIVE = 0x20;
+static const wchar_t kNoAsiSelect[] = L"ShowDemoLoginPopup";
+static const wchar_t kAsiSelect[] = L"ShowGameManual";
+static_assert(sizeof(kAsiSelect) <= sizeof(kNoAsiSelect), "the new name must fit the old one's buffer");
+typedef TArray<wchar_t> FString;
+
+static bool StrIs(const FString* s, const wchar_t* w) {
+    if (IsBadReadPtr(s, sizeof(*s)) || !s->Data || s->Count != (int32_t)wcslen(w) + 1) return false;
+    if (IsBadReadPtr(s->Data, s->Count * sizeof(wchar_t))) return false;
+    return wcscmp(s->Data, w) == 0;
+}
+
+static UObject* g_lastMenu = nullptr;   // the menu instance last logged
+static bool     g_badLayoutLogged = false;
+static void RewriteSelect(UObject* menu) {
+    auto* arr = (TArray<uint8_t>*)((uint8_t*)menu + OFF_RTT_LISTENTRIES);
+    bool layoutOk = !IsBadReadPtr(arr, sizeof(*arr)) && arr->Data && arr->Count > 0 && arr->Count <= 256 && arr->Count <= arr->Max
+                    && !IsBadReadPtr(arr->Data, arr->Count * MMLISTENTRY_SIZE)
+                    && StrIs((FString*)(arr->Data + OFF_MM_LISTID), L"RootList");   // LE3's first entry, Resume
+    if (!layoutOk) {
+        if (!g_badLayoutLogged) L("select: ListEntries not where LExSDK puts it (0x%zx): the entry stays the no-ASI message", OFF_RTT_LISTENTRIES);
+        g_badLayoutLogged = true;
+        return;
+    }
+    int rewritten = 0, already = 0;
+    for (int i = 0; i < arr->Count; ++i) {
+        uint8_t* e = arr->Data + i * MMLISTENTRY_SIZE;
+        auto* sel = (FString*)(e + OFF_MM_FNCONSELECT);
+        if (!StrIs((FString*)(e + OFF_MM_LISTID), L"RootList") || !StrIs((FString*)(e + OFF_MM_FNCACTIVE), L"CanShowMultiplayer")) continue;
+        if (StrIs(sel, kAsiSelect)) { ++already; continue; }
+        if (!StrIs(sel, kNoAsiSelect) || IsBadWritePtr(sel->Data, sizeof(kNoAsiSelect))) continue;
+        memcpy(sel->Data, kAsiSelect, sizeof(kAsiSelect));
+        sel->Count = (int32_t)(sizeof(kAsiSelect) / sizeof(wchar_t));
+        ++rewritten;
+    }
+    if (menu != g_lastMenu || rewritten) {
+        L("select: menu %p: %d entry(ies) %ls -> %ls, %d already", (void*)menu, rewritten, kNoAsiSelect, kAsiSelect, already);
+        g_lastMenu = menu;
+    }
+}
+
 static DWORD g_lastTry = 0;
 static int   g_tries = 0;
 
@@ -233,6 +293,7 @@ static void HookCallListFnc(UObject* self, void* stack, void* result) {
             if (g_cls) g_tries = 0;   // loaded: a later map change may unload it, then try again
         }
     }
+    if (self) RewriteSelect(self);
     g_origCallListFnc(self, stack, result);
 }
 
