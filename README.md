@@ -4,7 +4,8 @@
 [![License: MIT](https://img.shields.io/github/license/PayDay42/lemp-asi)](LICENSE)
 
 The native plugin of **LEMP**, Mass Effect 3's horde mode multiplayer for the
-Mass Effect Legendary Edition. The mod itself is a DLC folder
+Mass Effect Legendary Edition
+([Nexus Mods](https://www.nexusmods.com/masseffectlegendaryedition/mods/3463)). The mod itself is a DLC folder
 (`DLC_MOD_LEMultiplayer`); `lemp.asi` is the part that runs as code inside
 `MassEffect3.exe`, loaded by an ASI loader (LEBinkProxy). It provides what the
 DLC's UnrealScript cannot: the online lobby and matchmaking through the LEMP
