@@ -1,5 +1,8 @@
 # lemp.asi
 
+[![Latest tag](https://img.shields.io/github/v/tag/PayDay42/lemp-asi?label=release)](https://github.com/PayDay42/lemp-asi/tags)
+[![License: MIT](https://img.shields.io/github/license/PayDay42/lemp-asi)](LICENSE)
+
 The native plugin of **LEMP**, Mass Effect 3's horde mode multiplayer for the
 Mass Effect Legendary Edition. The mod itself is a DLC folder
 (`DLC_MOD_LEMultiplayer`); `lemp.asi` is the part that runs as code inside
