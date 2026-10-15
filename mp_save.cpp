@@ -757,6 +757,8 @@ static void ServeOnline(UObject* self) {
     // The release check (lemp_online.h): 39 sets the release, 40/41 the verdict.
     case 39: *result = online::SetVersion(input()); return;
     case 40: case 41: fill(online::VersionText(), 40); return;
+    // The release this lemp.asi was built for: the DLC's script compares its own.
+    case 55: case 56: fill(online::Release(), 55); return;
     // UTC seconds, the clock the native challenge filters read through
     // online_api.asi: script's own clock,
     // GetComponentAPI().GetCurrentTime(), is None here and reads 0.
@@ -989,9 +991,9 @@ static void HookSaveConfig(UObject* self, void* stack, void* result) {
     }
     else if (_stricmp(cls, "SFXMPProfileName") == 0) {
         int32_t* op = IntProp(self, "AsiOp");
-        // The online statistics and the release check (no AsiIndex needed);
-        // a code join's search, 20-25 (21 needs its AsiIndex).
-        if (op && (*op == 32 || *op == 33 || (*op >= 39 && *op <= 41) || (*op >= 20 && *op <= 25))) ServeOnline(self);
+        // The online statistics, the release check and lemp.asi's release (no
+        // AsiIndex needed); a code join's search, 20-25 (21 needs its AsiIndex).
+        if (op && (*op == 32 || *op == 33 || (*op >= 39 && *op <= 41) || *op == 55 || *op == 56 || (*op >= 20 && *op <= 25))) ServeOnline(self);
         else if (op && *op >= 50 && *op <= 52) ServeImport(self);
         else ServeName(self);
     }

@@ -49,6 +49,14 @@ namespace online {
 
 static const char* kDefaultServer = "https://lemp-master.me-legendary-mp.workers.dev";
 
+// The LEMP release this lemp.asi was built for (build.sh, from VERSION). The
+// DLC and lemp.asi ship as a pair: script hands over the DLC's release (op 39)
+// and reads this one (ops 55/56). "" in a build without it (the tests): no check.
+#ifndef LEMP_RELEASE
+#define LEMP_RELEASE ""
+#endif
+static const char* kRelease = LEMP_RELEASE;
+
 // 2012's SFXOnlineEvent_QuickMatch.SFXOnlineQuickMatchOutcome, as script's
 // OnQuickMatchComplete takes it.
 enum Outcome { IN_PROGRESS = 0, CREATE = 1, JOIN = 2, SEARCH_TIMEOUT = 3, FAILED = 4 };
@@ -64,6 +72,8 @@ struct State {
     bool serverOk = false;
     std::string build;           // the join identity (build_key.h JoinOptions)
     std::string version;         // the mod's release, from script (op 39): X-LEMP-Version
+    std::string dlcRelease;      // what op 39 said, also when it is not kRelease
+    bool releaseMismatch = false;
     HANDLE buildReady = nullptr; // mp_save's key thread
     std::string (*getBuild)() = nullptr;
     HINTERNET session = nullptr;
@@ -1170,14 +1180,40 @@ static DWORD WINAPI VersionThread(LPVOID) {
     return 0;
 }
 // 39: the release, as script has it (the DLC's config); a change asks again.
+// Another release than kRelease is a DLC and lemp.asi of two releases: every
+// join fails on the build key (it hashes lemp.asi), and the server would be
+// told a release this ASI is not. So no X-LEMP-Version is sent (the server
+// refuses a request without one) and ops 40/41 answer "required" without
+// asking: a DLC whose script predates the check still greys out Matchmaking.
 static int SetVersion(const std::string& version) {
+    bool mismatch = *kRelease && version != kRelease;
     EnterCriticalSection(&g.cs);
-    if (version != g.version) { g.version = version; g_versionAsked = false; g_versionText.clear(); }
+    bool changed = version != g.dlcRelease;
+    if (changed) {
+        g.dlcRelease = version;
+        g.releaseMismatch = mismatch;
+        g.version = mismatch ? "" : version;
+        g_versionAsked = false;
+        g_versionText.clear();
+    }
     LeaveCriticalSection(&g.cs);
+    if (changed && mismatch)
+        Log("online: release mismatch: the DLC is %s, lemp.asi %s; online requests go without a release", version.c_str(), kRelease);
     return 0;
 }
+// 55/56.
+static std::string Release() { return kRelease; }
 // 40/41.
 static std::string VersionText() {
+    EnterCriticalSection(&g.cs);
+    bool mismatch = g.releaseMismatch;
+    LeaveCriticalSection(&g.cs);
+    // An older script reads this as the server's verdict: "This is LEMP <the
+    // DLC's>; Matchmaking needs LEMP <kRelease>.", then the message (the box
+    // shows two lines of ~68 characters).
+    if (mismatch)
+        return Opt("status", "required") + Opt("latest", kRelease) + Opt("minimum", kRelease)
+             + Opt("message", std::string("lemp.asi is ") + kRelease + ": install the DLC and lemp.asi from one release.");
     if (!g.serverOk) return Opt("error", "no server address");
     EnterCriticalSection(&g.cs);
     bool ask = !g_versionAsked;
@@ -1241,6 +1277,7 @@ static void Init(const std::wstring& dir, LogFn log, HANDLE buildReady, std::str
     g.session = WinHttpOpen(L"LEMP/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (g.session) WinHttpSetTimeouts(g.session, 5000, 5000, 5000, 8000);
     Log("online: MP server %s%s", url.c_str(), g.serverOk ? "" : " (not a URL: matchmaking is off)");
+    Log("online: lemp.asi release %s", *kRelease ? kRelease : "(none built in)");
 }
 
 // ---- the ops, on the game thread: never block -------------------------------------

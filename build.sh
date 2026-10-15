@@ -13,6 +13,13 @@ FLAGS=(-O2 -std=c++17 -municode -Wall -Wno-unused-parameter)
 # named the build machine's paths. libopus.a is built the same
 # way (fetch-deps.sh).
 FLAGS+=(-ffile-prefix-map="$(cd ../.. && pwd)"=lemp)
+# The LEMP release this lemp.asi belongs to, compiled in (lemp_online.h
+# kRelease): the DLC's ModVersion must equal it. VERSION beside this script
+# (the published repository), else the project's.
+REL_FILE=VERSION; [ -f "$REL_FILE" ] || REL_FILE=../../VERSION
+LEMP_RELEASE=${LEMP_RELEASE:-$(tr -d ' \r\n' < "$REL_FILE")}
+[[ "$LEMP_RELEASE" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || { echo "build.sh: no release in $REL_FILE: '$LEMP_RELEASE'" >&2; exit 1; }
+FLAGS+=(-DLEMP_RELEASE="\"$LEMP_RELEASE\"")
 # Voice chat's libraries (fetch-deps.sh): vendor/ sits in the main checkout, also
 # when this runs from a worktree (gitignored, so a worktree has none).
 VENDOR=${VENDOR:-$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)/vendor}
@@ -36,5 +43,5 @@ for t in "${targets[@]}"; do
     else
         "$CXX" "${LINK[@]}" -o "$t.asi" "$t.cpp" "${FLAGS[@]}"
     fi
-    echo "built: $PWD/$t.asi  ($(stat -c%s "$t.asi") bytes)"
+    echo "built: $PWD/$t.asi  ($(stat -c%s "$t.asi") bytes, release $LEMP_RELEASE)"
 done

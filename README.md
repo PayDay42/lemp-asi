@@ -25,7 +25,8 @@ Cross-compiled on Linux with MinGW-w64 (`x86_64-w64-mingw32-g++`, C++17):
 ```
 
 `build.sh` also builds the research probes named on its command line; with
-no arguments it builds `lemp.asi` only.
+no arguments it builds `lemp.asi` only. It compiles in the release from
+`VERSION`: the LEMP DLC refuses a `lemp.asi` of another release.
 
 The binary is built with `-ffile-prefix-map`, so it carries no path of the
 machine it was built on.
