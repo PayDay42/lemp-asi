@@ -90,18 +90,10 @@ static const DWORD START_DELAY_MS = 15000;  // let the engine finish init
 static const DWORD POLL_MS        = 2000;
 
 static uint8_t* g_base = nullptr;
-static FILE*    g_log  = nullptr;
 
 static void L(const char* fmt, ...) {
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, a);
-        fputc('\n', g_log);
-        fflush(g_log);
-    }
+    LempLogV("nofocuspause", fmt, a);
     va_end(a);
 }
 
@@ -117,8 +109,6 @@ static void describe(uint32_t w, char* out, size_t cap) {
 }
 
 static DWORD WINAPI Thread(LPVOID) {
-    g_log = LempOpenDebugLog("nofocuspause");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     L("== nofocuspause ==  pid %lu  base %p", GetCurrentProcessId(), (void*)g_base);

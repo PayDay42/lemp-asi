@@ -289,18 +289,10 @@ static const uintptr_t RVA_LANDMARK = 0x65FDE6;
 static const uint8_t   LANDMARK[]   = {0x48, 0x8D, 0x15, 0xE3, 0xF9, 0xBB, 0x00};
 
 static uint8_t* g_base = nullptr;
-static FILE*    g_log  = nullptr;
 
 static void L(const char* fmt, ...) {
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, a);
-        fputc('\n', g_log);
-        fflush(g_log);
-    }
+    LempLogV("join_patch", fmt, a);
     va_end(a);
 }
 
@@ -342,8 +334,6 @@ static DWORD WINAPI Thread(LPVOID) {
     GetModuleFileNameA(GetModuleHandleA(nullptr), path, MAX_PATH);
     char* slash = strrchr(path, '\\');
     if (slash) *slash = 0;
-    g_log = LempOpenDebugLog("join_patch");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
 

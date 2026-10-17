@@ -101,20 +101,14 @@ uint8_t*     g_base = nullptr;
 uint8_t*     g_end = nullptr;
 FNameEntry** g_pools = nullptr;
 TArray<UObject*>* g_objs = nullptr;
-FILE*        g_log = nullptr;
 void**       g_gnatives = nullptr;
 size_t       g_propOffsetAt = 0;
 RecvFromFn   g_realRecvFrom = nullptr;
 SendToFn     g_realSendTo = nullptr;
 
 void L(const char* fmt, ...) {
-    if (!g_log) return;
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    fprintf(g_log, "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    vfprintf(g_log, fmt, a);
-    fputc('\n', g_log);
-    fflush(g_log);
+    LempLogV("voice", fmt, a);
     va_end(a);
 }
 
@@ -1029,7 +1023,6 @@ void HookTlkLookup() {
 }
 
 DWORD WINAPI Thread(LPVOID) {
-    g_log = LempOpenDebugLog("voice");
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     uint32_t peOff = *(uint32_t*)(g_base + 0x3C);

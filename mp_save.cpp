@@ -2,7 +2,9 @@
 //
 // NOT A PROBE. THIS ASI WRITES TO GAME MEMORY, like join_patch and tick_hook:
 // one GNatives slot and one UFunction::Func pointer (both SaveConfig's), plus
-// the script properties of SFXMPLocalSave objects it is asked to serve.
+// the script properties of SFXMPLocalSave objects it is asked to serve, and,
+// when script asks (ops 57-59, below), class defaults and live objects through
+// the engine's own set command, as the console's `set` would.
 // It writes one file of its own:
 //     Documents\BioWare\Mass Effect Legendary Edition\Save\ME3\LEMP_mpsave.txt
 //     (LEMP_mpsave.bak.txt = the previous save)
@@ -37,7 +39,9 @@
 //                    ChallengeStrings[], GAWString (each if the class has
 //                    it) -> the file
 //   AsiOp 2  query:  read the file; NumClass, NumChar, NumChallenge, NumGAW
-//                    = its counts
+//                    = its counts. Each character's own weapon-id list is
+//                    fixed up here too, before anything is handed out by
+//                    ops 3/4 below (FixUnmappedWeapons; weapon_slot_fix.h)
 //   AsiOp 3  length: AsiLen = the length of slot AsiIndex (order: base,
 //                    reinforcements, facecodes, selected, classes...,
 //                    characters..., challenges..., gaw if any)
@@ -72,11 +76,16 @@
 #include <ctime>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "mp_save_format.h"
 #include "build_key.h"
 #include "lemp_online.h"
 #include "ea_import.h"
+#include "n7hq_import.h"
+#include "n7hq_synth.h"     // the N7 HQ pages -> the save (op 53)
+#include "balance_classify.h"
+#include "weapon_slot_fix.h"
 #include <atomic>
 
 static const uintptr_t RVA_NAME_POOLS = 0x17B33D0;   // as repl_probe
@@ -115,7 +124,6 @@ static uint8_t*     g_base = nullptr;
 static uint8_t*     g_end  = nullptr;
 static FNameEntry** g_pools = nullptr;
 static TArray<UObject*>* g_objs = nullptr;   // GObjects (ServePackages)
-static FILE*        g_log = nullptr;
 static size_t       g_propOffsetAt = 0;
 static ExecFn       g_origSaveConfig = nullptr;
 static std::wstring g_dir;     // local: LempDir(), .tmp files
@@ -130,13 +138,8 @@ static bool         g_haveLoaded = false;
 static std::atomic<void**> g_sharedGNatives{nullptr};
 
 static void L(const char* fmt, ...) {
-    if (!g_log) return;
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    fprintf(g_log, "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    vfprintf(g_log, fmt, a);
-    fputc('\n', g_log);
-    fflush(g_log);
+    LempLogV("mp_save", fmt, a);
     va_end(a);
 }
 
@@ -309,6 +312,39 @@ static int ReadSave(MPSaveData& d) {
 }
 
 // ---------------------------------------------------------------------------
+// A weapon id a save holds that the installed config no longer maps shifts
+// the other weapon into its slot (weapon_slot_fix.h has the mechanism and
+// why it belongs here, in this file, rather than in script).
+// Runs once, right after a successful load, on every character record —
+// before anything is ever handed to script (op 3/4, below). A valid
+// loadout is not re-serialized at all (FixCharacterRecord leaves the string
+// untouched when it has nothing to substitute), so this never costs a
+// byte-identical save its identity.
+// Control: LEMP\noweaponslotfix.txt disables this (the control, like
+// nofov.txt/nodebug.txt): every record is then handed through exactly as
+// read, including one the engine will go on to compact.
+static bool WeaponSlotFixOn() {
+    return GetFileAttributesW((LempDir() + L"\\noweaponslotfix.txt").c_str()) == INVALID_FILE_ATTRIBUTES;
+}
+static void FixUnmappedWeapons(MPSaveData& d) {
+    if (!WeaponSlotFixOn()) { L("weapon slot fix: noweaponslotfix.txt, skipped"); return; }
+    static const weaponslotfix::Mappings* s_mappings = nullptr;
+    if (!s_mappings) {
+        static weaponslotfix::Mappings m = weaponslotfix::BuildMappings();
+        s_mappings = &m;
+        L("weapon slot fix: %zu mapped id(s), %zu kit(s) in the baked table",
+          s_mappings->idToClass.size(), s_mappings->kitWeapons.size());
+    }
+    int total = 0;
+    for (auto& c : d.characters) {
+        std::vector<std::string> lines;
+        total += weaponslotfix::FixCharacterRecord(c, *s_mappings, lines);
+        for (auto& line : lines) L("%s", line.c_str());
+    }
+    if (total > 0) L("weapon slot fix: %d substitution(s) this load", total);
+}
+
+// ---------------------------------------------------------------------------
 // The ops, on the game thread.
 
 static void Serve(UObject* self) {
@@ -351,6 +387,7 @@ static void Serve(UObject* self) {
         MPSaveData d;
         int r = ReadSave(d);
         if (r == 0) {
+            FixUnmappedWeapons(d);
             g_loaded = d; g_haveLoaded = true; *nc = (int32_t)d.classes.size(); *nch = (int32_t)d.characters.size();
             if (int32_t* nchl = IntProp(self, "NumChallenge")) *nchl = (int32_t)d.challenges.size();
             if (int32_t* ngaw = IntProp(self, "NumGAW")) *ngaw = (int32_t)d.NumGaw();
@@ -399,6 +436,9 @@ static void Serve(UObject* self) {
 //   AsiOp 8 / 9 / 10   the last address joined   <-> mpaddress.txt
 //   AsiOp 11 / 12      the Windows clipboard's text (read only). 11 takes the
 //                      snapshot that 12 fills from, so both see the same text.
+//   AsiOp 80 / 81      the Multiplayer screen's notice for an install with other
+//                      mods or changed base files (build_key.h ModsNotice),
+//                      length / fill; "" (length 0) for a plain install.
 //   AsiOp 13 / 14      this install's identity as join options (build_key.h
 //                      JoinOptions): "LEMPBuild=<12 hex>?LEMPGame=...?LEMPAsi=
 //                      ...?LEMPBase=...?LEMPMods=...". The joining client
@@ -460,6 +500,21 @@ static void Serve(UObject* self) {
 //                   ?stage=1-4?name=?summary=?error=". On done the save file
 //                   already holds the profile; the previous one was copied to
 //                   LEMP_mpsave.preimport-<date>-<time>.txt beside it.
+//   AsiOp 53        read a console profile from N7 HQ (n7hq_import.h), AsiBuf
+//                   "?platform=xbox|ps3|wiiu?name=<console name>": 0 started,
+//                   1 one is running, 2 a platform or name it refuses. Its
+//                   status is 51/52's, with ?kind=n7hq, ?stage=1-4, ?page=1-5
+//                   (stage 4), ?pages= and, on failure, ?error= and ?hint= (the
+//                   box's two lines). It writes the pages under LEMP\n7hq and
+//                   never the save.
+// Ops 72/73, to SFXMPLocalSave: the field of view (ServeCamera, below).
+//   AsiOp 72        AsiIndex = the saved FOV, 70-110 (70 without a file)
+//   AsiOp 73        save AsiIndex, clamped to 70-110, to LEMP\camera.txt
+//                   Both answer 3 while LEMP\nofov.txt exists (the control).
+// Ops 74/75, to SFXMPLocalSave: the log (ServeLog, below).
+//   AsiOp 74        AsiIndex = 1 while the log is written, else 0
+//   AsiOp 75        log on (AsiIndex 1) or off (0) from now on, and saved
+//                   (LEMP\nodebug.txt); AsiResult 1 if it could not be saved
 struct TextFile {
     const wchar_t* file;
     const wchar_t* tmp;
@@ -540,6 +595,7 @@ static bool g_clipExists = false;
 // MP join or lobby is far later than that in practice.
 static HANDLE g_keyThread = nullptr;
 static std::u16string g_buildKey;   // JoinOptions, or empty: none (no DLC key)
+static std::u16string g_modsNotice; // build_key.h ModsNotice, or empty: a plain install
 
 static std::wstring GameDir() {
     wchar_t exe[MAX_PATH] = {0};
@@ -558,13 +614,22 @@ static DWORD WINAPI KeyThread(LPVOID) {
     cache.Load(g_dir + L"\\buildkey.cache");
     std::string full = buildkey::ComputeKey(dlc, cache, why);
     if (full.empty()) { L("buildkey: none for %ls: %s", dlc.c_str(), why.c_str()); return 0; }
+    std::vector<buildkey::Entry> base;
+    std::string exe = buildkey::RunningExeVersion(), mods = buildkey::OtherMods(game, L"DLC_MOD_LEMultiplayer");
     std::string opts = buildkey::JoinOptions(
-        buildkey::ShortKey(full), buildkey::RunningExeVersion(),
+        buildkey::ShortKey(full), exe,
         buildkey::HashFileList(game, buildkey::kPlayAsis, sizeof buildkey::kPlayAsis / sizeof *buildkey::kPlayAsis, cache),
-        buildkey::HashFileList(game, buildkey::kBaseFiles, sizeof buildkey::kBaseFiles / sizeof *buildkey::kBaseFiles, cache),
-        buildkey::OtherMods(game, L"DLC_MOD_LEMultiplayer"));
+        buildkey::HashFileList(game, buildkey::kBaseFiles, sizeof buildkey::kBaseFiles / sizeof *buildkey::kBaseFiles, cache, &base),
+        mods);
     cache.Save();
     g_buildKey.assign(opts.begin(), opts.end());
+    // Base files are compared only on the exe version their plain hashes are
+    // of: another version's own files would all read as changed.
+    std::string changed = exe == buildkey::kBaseGameVersion ? buildkey::DifferentBaseFiles(base) : "";
+    std::string notice = buildkey::ModsNotice(mods, changed);
+    g_modsNotice.assign(notice.begin(), notice.end());
+    if (!notice.empty()) L("buildkey: not a plain install: mods \"%s\", changed base files \"%s\"%s", mods.c_str(),
+                           changed.c_str(), exe == buildkey::kBaseGameVersion ? "" : " (another exe version: not compared)");
     L("buildkey: %s (DLC %s; %d files hashed, %d cached, %lu ms)", opts.c_str(), full.c_str(), cache.hashed,
       cache.cached, (unsigned long)(GetTickCount() - t));
     return 0;
@@ -594,6 +659,12 @@ static void ServeName(UObject* self) {
         }
         if (*op == 13) { *len = g_buildKey.empty() ? -1 : (int32_t)g_buildKey.size(); *result = 0; }
         else *result = g_buildKey.empty() ? 2 : FillBuf(buf, g_buildKey, "buildkey") ? 0 : 4;
+        return;
+    }
+    if (*op == 80 || *op == 81) {
+        if (g_keyThread && WaitForSingleObject(g_keyThread, 60000) != WAIT_OBJECT_0) { *result = 2; return; }
+        if (*op == 80) { *len = (int32_t)g_modsNotice.size(); *result = 0; }
+        else *result = FillBuf(buf, g_modsNotice, "modsnotice") ? 0 : 4;
         return;
     }
     const TextFile* f = (*op >= 5 && *op <= 7) ? &kNameFile : (*op >= 8 && *op <= 10) ? &kAddressFile : nullptr;
@@ -635,6 +706,11 @@ static HANDLE g_impThread = nullptr;
 static int g_impState = 0;   // 0 idle, 1 running, 2 done, 3 failed
 static int g_impStage = 0;
 static std::string g_impName, g_impSummary, g_impError;
+static int g_impKind = 0;    // 0 the EA import, 1 N7 HQ (op 53)
+static int g_impPage = 0, g_impPages = 0;
+static std::string g_impHint;
+static std::string g_n7Platform, g_n7Name;   // op 53's request, set before its thread starts
+static std::string g_n7Session;               // a pasted N7 HQ session (ME3N7HQSID), from the clipboard
 
 // One option value for "?k=v" text: GameInfo.ParseOption has no escaping.
 static std::string OptionValue(std::string v) {
@@ -676,16 +752,160 @@ static DWORD WINAPI ImportThread(void*) {
     return 0;
 }
 
+// A saved N7 HQ tab, read back whole ("" if missing).
+static std::string ReadWholeFile(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "";
+    std::string text; char buf[65536]; DWORD got = 0;
+    while (ReadFile(h, buf, sizeof buf, &got, nullptr) && got > 0) text.append(buf, got);
+    CloseHandle(h);
+    return text;
+}
+
+// The pages N7 HQ gave, converted into the save (n7hq_convert.h, n7hq_synth.h):
+// merged onto the current save, which is kept first as
+// LEMP_mpsave.preimport-<date>-<time>.txt, as the EA import does. `err` says
+// why nothing was written.
+static bool ConvertN7(const std::wstring& dir, const std::string& name, std::string& summary, std::string& err) {
+    std::wstring stem = dir + L"\\" + std::wstring(g_n7Platform.begin(), g_n7Platform.end()) + L"-";
+    std::string fp = ea::n7hq::FilePart(name);
+    stem += std::wstring(fp.begin(), fp.end()) + L"-";
+    std::string ov = ReadWholeFile(stem + L"overview.html"), inv = ReadWholeFile(stem + L"inventory.html"),
+                ch = ReadWholeFile(stem + L"characters.html"), chal = ReadWholeFile(stem + L"challenges.html");
+    if (inv.empty() || ch.empty()) { err = "the saved inventory or characters page is missing"; return false; }
+    ea::n7conv::Profile p = ea::n7conv::Parse(ov, inv, ch, chal);
+    if (p.kits.empty() || p.items.empty()) { err = "N7 HQ's pages held no kits or items"; return false; }
+    MPSaveData cur;
+    int have = ReadSave(cur);
+    if (have == 2) { err = "the current save is unreadable, so nothing was replaced"; return false; }
+    ea::n7conv::SaveReport rep;
+    MPSaveData d = ea::n7conv::BuildSave(p, have == 0 ? &cur : nullptr, rep, ea::n7conv::KitClasses(), (long long)time(nullptr));
+    L("n7hq: converted: credits %lld, items %d (unmapped %d), consumables %d (unmapped %d), %d classes, characters %d kept + %d new, powers %d set, %d default",
+      p.credits, rep.vars.itemsPlaced, rep.vars.itemsUnmapped, rep.vars.consumablesPlaced, rep.vars.consumablesUnmapped,
+      rep.classes, rep.charsKept, rep.charsNew, rep.powersSet, rep.powersDefault);
+    const ea::n7conv::ChallengeReport& cr = rep.challenges;
+    if (rep.challengesSet)
+        L("n7hq: challenges: %d golds + %d silvers read (%d unmapped, %d skipped), %d completed, %d progress counters, %lld challenge points",
+          cr.golds, cr.silvers, cr.unmapped, cr.skipped, cr.completed, cr.counters, cr.points);
+    else
+        L("n7hq: challenges: no challenges tab, the save keeps its own");
+    for (const std::string& u : rep.vars.unmapped) L("n7hq:   no id: %s", u.c_str());
+    for (const std::string& n : rep.notes) L("n7hq:   default powers: %s", n.c_str());
+    if (have == 0) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        wchar_t stamp[40];
+        swprintf(stamp, 40, L"%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        std::wstring keep = g_cloud + L"\\LEMP_mpsave.preimport-" + stamp + L".txt";
+        if (!CopyFileW(SavePath().c_str(), keep.c_str(), TRUE)) {
+            err = "could not keep a copy of the current save, so nothing was replaced";
+            L("n7hq: cannot copy the save to %ls (%lu)", keep.c_str(), GetLastError());
+            return false;
+        }
+        L("n7hq: the previous save is kept as %ls", keep.c_str());
+    }
+    if (!WriteSave(d)) { err = "the profile could not be written (see the debug log)"; return false; }
+    summary = std::to_string(rep.classes) + " classes, " + std::to_string(rep.charsKept + rep.charsNew) + " characters";
+    if (rep.challengesSet) summary += ", " + std::to_string(cr.completed) + " challenges";
+    return true;
+}
+
+// N7 HQ (op 53): a profile's pages read and saved, then converted into the
+// save.
+static DWORD WINAPI N7Thread(void*) {
+    WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
+    ea::n7hq::Outcome o;
+    std::wstring dir = LempDir() + L"\\n7hq";
+    bool ok = ea::n7hq::ReadProfile(g_n7Platform, g_n7Name, dir, o,
+        [](int stage, int page) {
+            EnterCriticalSection(&g_impCs); g_impStage = stage; g_impPage = page; LeaveCriticalSection(&g_impCs);
+            if (page <= 1) L("n7hq: step %d of 4", stage);
+        },
+        [](const std::string& line) { L("%s", line.c_str()); },
+        g_n7Session);
+    g_n7Session.assign(g_n7Session.size(), '\0'); g_n7Session.clear();
+    int stage;
+    EnterCriticalSection(&g_impCs); stage = g_impStage; LeaveCriticalSection(&g_impCs);
+    std::string summary;
+    if (ok) {
+        L("n7hq: saved %d page(s) to %ls\\%s-%s-*.html", o.pages, dir.c_str(), g_n7Platform.c_str(), ea::n7hq::FilePart(o.name).c_str());
+        std::string err;
+        if (ConvertN7(dir, o.name, summary, err)) {
+            L("n7hq: done: imported %s (%s)", o.name.c_str(), summary.c_str());
+        } else {
+            ok = false;
+            o.line1 = "The profile was read but not imported.";
+            o.line2 = "Nothing was changed, send mp_save.log.";
+            o.detail = err;
+            L("n7hq: not imported: %s", err.c_str());
+        }
+    } else {
+        L("n7hq: failed at step %d: %s / %s (%s)", stage, o.line1.c_str(), o.line2.c_str(), o.detail.c_str());
+    }
+    EnterCriticalSection(&g_impCs);
+    g_impState = ok ? 2 : 3;
+    g_impName = o.name; g_impPages = o.pages; g_impSummary = summary;
+    g_impError = ok ? "" : o.line1; g_impHint = ok ? "" : o.line2;
+    LeaveCriticalSection(&g_impCs);
+    return 0;
+}
+
 static void ServeImport(UObject* self) {
     int32_t* op = IntProp(self, "AsiOp");
     int32_t* result = IntProp(self, "AsiResult");
     FStringRaw* buf = StrProp(self, "AsiBuf");
     int32_t* len = IntProp(self, "AsiLen");
     if (!op || !result || !buf || !len) { L("import: SFXMPProfileName lacks AsiOp/AsiResult/AsiBuf/AsiLen"); if (result) *result = 5; return; }
+    if (*op == 53) {
+        std::u16string text; std::string why, ascii;
+        if (!ReadFString(buf, text, why)) { L("n7hq: AsiBuf: %s", why.c_str()); *result = 2; return; }
+        for (char16_t c : text) {
+            if (c > 126 || c < 32) { L("n7hq: refused: the request is not plain text"); *result = 2; return; }
+            ascii += (char)c;
+        }
+        auto m = online::ParseOptions(ascii);
+        std::string platform = m["platform"], name = m["name"];
+        if (!ea::n7hq::FindPlatform(platform) || !ea::n7hq::ValidName(name)) {
+            L("n7hq: refused: platform '%s', name of %zu char(s)", platform.c_str(), name.size()); *result = 2; return;
+        }
+        EnterCriticalSection(&g_impCs);
+        bool running = g_impState == 1;
+        if (!running) {
+            g_impState = 1; g_impStage = 0; g_impKind = 1; g_impPage = 0; g_impPages = 0;
+            g_impName.clear(); g_impSummary.clear(); g_impError.clear(); g_impHint.clear();
+        }
+        LeaveCriticalSection(&g_impCs);
+        if (running) { *result = 1; return; }
+        if (g_impThread) { CloseHandle(g_impThread); g_impThread = nullptr; }
+        g_n7Platform = platform; g_n7Name = name;
+        // The player's pasted N7 HQ sign-in (their ME3N7HQSID session), from
+        // the op 53 request: a browser session carries N7 HQ's full scopes,
+        // which the EA app's token cannot, so the read uses it in place of an
+        // EA sign-in. The menu already extracts the id from what was pasted;
+        // this accepts only its characters and caps the length. It is a
+        // credential and is never logged (only whether one was given).
+        g_n7Session.clear();
+        {
+            std::string sid = m["session"];
+            bool okSid = !sid.empty() && sid.size() <= 128;
+            for (char ch : sid) if (!(isalnum((unsigned char)ch) || ch == '-' || ch == '_')) okSid = false;
+            if (okSid) g_n7Session = sid;
+            else if (!sid.empty()) L("n7hq: the pasted sign-in is not a valid session, ignoring it");
+        }
+        L("n7hq: started (the player agreed): platform=%s name='%s'%s", platform.c_str(), name.c_str(),
+          g_n7Session.empty() ? " (no pasted sign-in)" : " (using the pasted N7 HQ sign-in)");
+        g_impThread = CreateThread(nullptr, 0, N7Thread, nullptr, 0, nullptr);
+        if (!g_impThread) {
+            EnterCriticalSection(&g_impCs);
+            g_impState = 3; g_impError = "LEMP could not start the import."; g_impHint = "Restart the game and try again.";
+            LeaveCriticalSection(&g_impCs);
+        }
+        *result = 0;
+        return;
+    }
     if (*op == 50) {
         EnterCriticalSection(&g_impCs);
         bool running = g_impState == 1;
-        if (!running) { g_impState = 1; g_impStage = 0; g_impName.clear(); g_impSummary.clear(); g_impError.clear(); }
+        if (!running) { g_impState = 1; g_impStage = 0; g_impKind = 0; g_impName.clear(); g_impSummary.clear(); g_impError.clear(); g_impHint.clear(); }
         LeaveCriticalSection(&g_impCs);
         if (running) { *result = 1; return; }
         if (g_impThread) { CloseHandle(g_impThread); g_impThread = nullptr; }
@@ -701,6 +921,8 @@ static void ServeImport(UObject* self) {
     EnterCriticalSection(&g_impCs);
     std::string text = std::string("?state=") + kStates[g_impState] + "?stage=" + std::to_string(g_impStage) +
                        "?name=" + OptionValue(g_impName) + "?summary=" + OptionValue(g_impSummary) + "?error=" + OptionValue(g_impError);
+    if (g_impKind == 1)
+        text += "?kind=n7hq?page=" + std::to_string(g_impPage) + "?pages=" + std::to_string(g_impPages) + "?hint=" + OptionValue(g_impHint);
     LeaveCriticalSection(&g_impCs);
     std::u16string v; ea::Utf8To16(text, v);
     if (*op == 51) { *len = (int32_t)v.size(); *result = 0; }
@@ -964,8 +1186,660 @@ static void ServePackages(UObject* self) {
     *result = 6;
 }
 
+// ---------------------------------------------------------------------------
+// Ops 57-59, to SFXMPLocalSave: the engine's `set`/`get`, without the console.
+//
+// SFXGRIMP applies MP-only values to classes the campaign shares (weapon
+// damage, ammo, weight) with `set <Class> <Prop> <Value>` at match start and
+// restores them after. Through ConsoleCommand that does nothing in a network
+// session: every `get` answers empty and no value changes. The console layer
+// refuses there; the command code below it has no such check. So this calls
+// it directly:
+//   AsiOp 57        AsiBuf = "<Class> <Prop> <Value>": PerformSetCommand, the
+//                   function SET and SETNOPEC call (bNotifyObjectOfChange = 1,
+//                   as SET). It imports the text as config loading does and
+//                   writes it into the class default object and every live
+//                   object of the class.
+//                   Result 0 done. A WORKING set is NOT silent here: with
+//                   bNotify=1 this exe echoes "Executing set command <value>"
+//                   every time it runs (this op
+//                   used to treat ANY output as a failure, so a real set was
+//                   logged and counted the same as one that never ran;
+//                   balance_classify.h). A genuine problem: 1 some other
+//                   engine message (logged), 2 not available in this exe, 3
+//                   "Unrecognized property <P> on class <C>" (the class
+//                   loaded, has no such property — SFXGRIMP does not retry
+//                   this one).
+//   AsiOp 58 / 59   AsiBuf = "<Class> <Prop>": GET through the command
+//                   dispatcher, length / fill: the value as text.
+//                   The same class/property lookup prints the same two
+//                   failure messages for GET [R: inferred from 57's text and
+//                   the counts it explains in the reopened build 6 run — 58
+//                   never logged its own text before this fix, so this is not
+//                   yet seen directly for GET]: AsiLen/AsiBuf answer "" and
+//                   result 4 for "Unrecognized class or object" (not loaded
+//                   yet: SFXGRIMP retries it), result 5 for "Unrecognized
+//                   property" (found the class, never resolves: SFXGRIMP
+//                   marks it and stops). Any other message: "" and result 1
+//                   (logged, once per distinct "<Class> <Prop>" this
+//                   process — SFXGRIMP reruns the whole list at every menu,
+//                   lobby and match transition, and a still-pending entry is
+//                   asked again every 2 s). 58 answers 2 as 57 does.
+//
+// Neither has a symbol. They are pinned for this exe and used only if the
+// code at both call sites still reads: lea rdx,"SET" ... call PerformSetCommand,
+// lea rdx,"SETNOPEC" ... call PerformSetCommand, and lea rdx,"GET" inside the
+// dispatcher. Any other exe gets result 2, never a guess.
+static const uintptr_t RVA_EXEC_DISPATCH = 0x132E60;   // static (const TCHAR* Cmd, FOutputDevice& Ar)
+static const uintptr_t RVA_PERFORM_SET   = 0x12B700;   // (const TCHAR* Str, FOutputDevice& Ar, UBOOL bNotify)
+static const uintptr_t RVA_SET_LEA       = 0x133CD5, RVA_SET_CALL      = 0x133CF3;
+static const uintptr_t RVA_SETNOPEC_LEA  = 0x133CFD, RVA_SETNOPEC_CALL = 0x133D1D;
+static const uintptr_t RVA_GET_LEA       = 0x132F05;
+
+typedef void (*ExecDispatchFn)(const char16_t* cmd, void* ar);
+typedef void (*PerformSetFn)(const char16_t* str, void* ar, int32_t notify);
+static int            g_setState = 0;   // 0 not checked, 1 verified, -1 refused
+static ExecDispatchFn g_execDispatch = nullptr;
+static PerformSetFn   g_performSet = nullptr;
+
+// The rel32 target of a 7-byte `lea r64,[rip+disp32]` or a 5-byte `call rel32`.
+static uint8_t* RelTarget(uint8_t* at, size_t len, size_t dispAt) {
+    if (at < g_base || at + len > g_end || IsBadReadPtr(at, len)) return nullptr;
+    int32_t disp; memcpy(&disp, at + dispAt, 4);
+    return at + len + disp;
+}
+static bool LeaRdxTo(uintptr_t rva, const char16_t* want) {
+    uint8_t* at = g_base + rva;
+    if (at + 7 > g_end || IsBadReadPtr(at, 7) || at[0] != 0x48 || at[1] != 0x8D || at[2] != 0x15) return false;
+    const char16_t* s = (const char16_t*)RelTarget(at, 7, 3);
+    size_t n = 0; while (want[n]) ++n;
+    if (!s || (uint8_t*)s < g_base || (uint8_t*)(s + n + 1) > g_end || IsBadReadPtr(s, (n + 1) * 2)) return false;
+    return memcmp(s, want, (n + 1) * 2) == 0;
+}
+static bool CallTo(uintptr_t rva, uintptr_t targetRva) {
+    uint8_t* at = g_base + rva;
+    if (at + 5 > g_end || IsBadReadPtr(at, 5) || at[0] != 0xE8) return false;
+    return RelTarget(at, 5, 1) == g_base + targetRva;
+}
+static bool VerifySetCommand() {
+    if (g_setState) return g_setState > 0;
+    bool ok = LeaRdxTo(RVA_SET_LEA, u"SET") && CallTo(RVA_SET_CALL, RVA_PERFORM_SET)
+           && LeaRdxTo(RVA_SETNOPEC_LEA, u"SETNOPEC") && CallTo(RVA_SETNOPEC_CALL, RVA_PERFORM_SET)
+           && LeaRdxTo(RVA_GET_LEA, u"GET");
+    if (ok) {
+        // Both sites must lie in the dispatcher the GET op calls.
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry((DWORD64)(g_base + RVA_SET_LEA), &imageBase, nullptr);
+        PRUNTIME_FUNCTION g = RtlLookupFunctionEntry((DWORD64)(g_base + RVA_GET_LEA), &imageBase, nullptr);
+        ok = f && g && f->BeginAddress == RVA_EXEC_DISPATCH && g->BeginAddress == RVA_EXEC_DISPATCH;
+    }
+    g_setState = ok ? 1 : -1;
+    if (ok) {
+        g_execDispatch = (ExecDispatchFn)(g_base + RVA_EXEC_DISPATCH);
+        g_performSet = (PerformSetFn)(g_base + RVA_PERFORM_SET);
+    }
+    L("balance: set/get command code %s", ok ? "verified" : "NOT as expected in this exe; ops 57-59 answer 2");
+    return ok;
+}
+
+// A minimal FOutputDevice: vtable slot 1 is Serialize(const TCHAR*, EName),
+// which Log/Logf call; every other slot does nothing. It collects the text.
+// In this exe FOutputDevice::Log (rva 0x113130, the call GET makes with the
+// value) returns at once when the dword at +8 is set, or +0xC and a global
+// are; otherwise it jumps through [vtable+8] with the text in rdx. The
+// device is static, so both flags stay 0 and every line reaches slot 1.
+struct CaptureDevice { void** vtbl; uint32_t flags[8]; };
+static std::u16string g_capture;
+static void* DevNop(void* self, void*, void*, void*) { return self; }
+// Readability is checked once per page, not per character: IsBadReadPtr is
+// a VirtualQuery here (safe_read.h), and a per-character call made a long
+// GET cost thousands of them. The old 4096-character cap clipped the two
+// difficulty tables' values (their GET text is longer), which a restore
+// would then have written back clipped; 1M characters is a runaway guard
+// only. A char16_t never straddles a page, so the page check covers it.
+static void DevSerialize(void* self, const char16_t* v, int32_t event) {
+    if (!v) return;
+    for (size_t n = 0; n < (1u << 20); ++n) {
+        if ((n == 0 || ((uintptr_t)(v + n) & 0xFFF) == 0) && IsBadReadPtr(v + n, 2)) break;
+        if (!v[n]) break;
+        g_capture += v[n];
+    }
+}
+static void* g_devVtbl[16];
+static CaptureDevice* Device() {
+    static CaptureDevice dev;
+    if (!dev.vtbl) {
+        for (auto& p : g_devVtbl) p = (void*)&DevNop;
+        g_devVtbl[1] = (void*)&DevSerialize;
+        dev.vtbl = g_devVtbl;
+    }
+    g_capture.clear();
+    return &dev;
+}
+
+static std::u16string g_getText;
+
+// GET's own failure text, logged once per distinct "<Class> <Prop>" per
+// process rather than every time it is asked: SFXGRIMP reruns the whole
+// MPBalanceSettings list at every menu/lobby/match transition, and asks
+// again every 2 s for as long as an entry stays pending, so without this a
+// single build 6 session wrote the same "Unrecognized ..." line for one
+// not-yet-loaded weapon dozens of times.
+static std::unordered_set<std::string> g_getLogged;
+static void LogGetProblem(const std::string& ascii, const std::u16string& raw) {
+    if (!g_getLogged.insert(ascii).second) return;
+    L("balance: get %s: %s", ascii.c_str(), std::string(raw.begin(), raw.end()).c_str());
+}
+
+static double QpcMicros(LARGE_INTEGER a, LARGE_INTEGER b);
+// One SET or GET over 8 ms, by name: the balance timing line gives only the
+// average and the maximum per 500 ops, which cannot say which entry or which
+// of the two calls stalls a frame. At most 40 lines a process.
+static void NoteSlowBalanceOp(int op, const std::string& target, double us) {
+    static int logged = 0;
+    if (us < 8000.0 || logged >= 40) return;
+    ++logged;
+    L("balance: slow %s %s: %.1f ms", op == 57 ? "set" : "get", target.c_str(), us / 1000.0);
+}
+
+static void ServeBalance(UObject* self) {
+    int32_t* op = IntProp(self, "AsiOp");
+    int32_t* result = IntProp(self, "AsiResult");
+    FStringRaw* buf = StrProp(self, "AsiBuf");
+    int32_t* len = IntProp(self, "AsiLen");
+    if (!op || !result || !buf || !len) { L("balance: %s lacks AsiOp/AsiResult/AsiBuf/AsiLen", ClassNameOf(self)); if (result) *result = 5; return; }
+    if (*op == 59) { *result = FillBuf(buf, g_getText, "balance") ? 0 : 4; return; }
+    if (!VerifySetCommand()) { *result = 2; return; }
+    std::u16string in; std::string why;
+    if (!ReadFString(buf, in, why) || in.empty()) { L("balance: could not read AsiBuf: %s", why.c_str()); *result = 1; return; }
+    std::string ascii(in.begin(), in.end());   // for the log only
+    if (*op == 57) {
+        CaptureDevice* dev = Device();
+        // bNotify = 0, as SETNOPEC: no PreEditChange/PostEditChange on the
+        // class default and on every live object of the class. With 1, one
+        // set of a weapon property took up to ~150 ms on the game thread
+        // (the balance timing line's serve max), a hitch each time a weapon
+        // class loaded mid-match and its entries were applied. The values set
+        // here (damage, ammo, weight, spread) are read when used, and the
+        // script reads each one back after the set, so the notification adds
+        // nothing. A working SETNOPEC prints nothing: Outcome::Nothing below.
+        LARGE_INTEGER s0, s1;
+        QueryPerformanceCounter(&s0);
+        g_performSet(in.c_str(), dev, 0);
+        QueryPerformanceCounter(&s1);
+        NoteSlowBalanceOp(57, ascii, QpcMicros(s0, s1));
+        // Nothing and "Executing set command ..." both mean the set ran
+        // (balance_classify.h): only a message naming an actual problem is a
+        // failure. Before this fix every non-empty capture — including that
+        // trace of a WORKING set — was logged and reported as one.
+        balance::Outcome r = balance::Classify(g_capture);
+        if (r != balance::Outcome::Nothing && r != balance::Outcome::Success) {
+            L("balance: set %s: %s", ascii.c_str(), std::string(g_capture.begin(), g_capture.end()).c_str());
+        }
+        *result = (r == balance::Outcome::Nothing || r == balance::Outcome::Success) ? 0
+                : (r == balance::Outcome::PropertyNotFound) ? 3 : 1;
+        return;
+    }
+    // 58: GET's length (59, above, fills AsiBuf from the text this leaves in
+    // g_getText). Unlike SET, "nothing" and the class/property lookup's own
+    // failure text both mean "no value" here: that is the one signal
+    // SFXGRIMP's pending check (AsiGet(...) == "") has ever had, and a real
+    // GET success always has SOME text (at minimum the value itself), so an
+    // empty capture is never mistaken for one. GET's text is classified by
+    // ClassifyGet, not SET's Classify: with Classify, a real value and GET's
+    // "Unrecognized class <C>" were both Other, so no GET ever succeeded.
+    std::u16string cmd = u"GET " + in;
+    CaptureDevice* dev = Device();
+    LARGE_INTEGER g0, g1;
+    QueryPerformanceCounter(&g0);
+    g_execDispatch(cmd.c_str(), dev);
+    QueryPerformanceCounter(&g1);
+    NoteSlowBalanceOp(58, ascii, QpcMicros(g0, g1));
+    std::u16string raw = g_capture;
+    while (!raw.empty() && (raw.back() == u'\n' || raw.back() == u'\r')) raw.pop_back();
+    balance::Outcome r = balance::ClassifyGet(raw);
+    if (r == balance::Outcome::Success) {
+        g_getText = raw;
+        *len = (int32_t)g_getText.size();
+        *result = 0;
+        return;
+    }
+    g_getText.clear();
+    *len = 0;
+    if (r != balance::Outcome::Nothing) LogGetProblem(ascii, raw);
+    *result = (r == balance::Outcome::ClassNotFound || r == balance::Outcome::Nothing) ? 4
+            : (r == balance::Outcome::PropertyNotFound) ? 5 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// The live config layer. ME3's MP took part of its balance from a coalesced
+// file the server sent at login, which the engine added to its config as a
+// layer named "LiveINI": classes then read it as config when they loaded,
+// weapon damage and the weapon types' mod lists among it. LE3 keeps that code.
+// LEMP's MP balance for the classes the campaign shares is such a file,
+// LEMPBalance.bin in the DLC's CookedPCConsole, and is added the same way:
+//
+//   - before the engine loads an MP map (MPLobby, BioP_MP*): AddLayer(GConfig,
+//     file, "LEMPBalance", 3, 1), the call LE3's LiveINI flush makes, if it
+//     is not on yet; before any other map: RemoveLayer(GConfig, layer, 1),
+//     so the campaign plays LE3's values. (2012 kept its live file for the
+//     whole session; here it is MP-only.)
+//   - op 78 (SFXGRIMP, at the start of every MP map): the layer on if it is
+//     not, in case the map's name could not be read.
+//   - after either, config is loaded again on the class defaults and live
+//     objects of every class the layer names that is loaded already (the
+//     engine lists them: GConfig's touched-class list), with one object walk.
+//     Classes that load later read the layer as config by themselves.
+//
+// Seen in game with a probe of this code: the pistol base's mod list 9 -> 10
+// entries with the layer, 9 again after RemoveLayer; weapons loaded mid-match
+// already had the layer's values; MP rebuilds the layer list when it starts
+// (8 layers) and keeps this one at priority 3, above the DLCs' 2.
+//
+// LEMP\nobalancelayer.txt is the control: no layer, LE3's values in MP.
+//
+// No symbols: every address is used only if the code around LE3's LiveINI
+// flush, the RELOADCONFIG command and UGameEngine::Tick's LoadMap call still
+// reads as pinned here.
+static const uintptr_t RVA_GCONFIG          = 0x17CD5B8;  // FConfigCacheIni* GConfig
+static const uintptr_t RVA_GENGINE          = 0x18B31D0;  // UGameEngine* GEngine
+static const uintptr_t RVA_ADD_LAYER        = 0x091700;   // (GConfig, const BYTE* Data, const TCHAR* Name, INT Priority, UBOOL bApply) -> layer
+static const uintptr_t RVA_REMOVE_LAYER     = 0x09F3E0;   // (GConfig, layer, UBOOL bApply)
+static const uintptr_t RVA_LOAD_CONFIG      = 0x128810;   // UObject::LoadConfig(this, UClass*, const TCHAR*, DWORD Flags, UProperty*)
+static const uintptr_t RVA_LIVEINI_NAME_LEA = 0xAF6D24;   // lea r8,"LiveINI"
+static const uintptr_t RVA_LIVEINI_GCONFIG  = 0xAF6D2B;   // mov rcx,[GConfig]
+static const uintptr_t RVA_LIVEINI_ADD      = 0xAF6D48;   // call AddLayer
+static const uintptr_t RVA_LIVEINI_REMOVE   = 0xAF6D7B;   // call RemoveLayer
+static const uintptr_t RVA_RELOADCFG_LEA    = 0x13407F;   // lea rdx,"RELOADCONFIG"
+static const uintptr_t RVA_RELOADCFG_CALL   = 0x134249;   // call LoadConfig (flags 9)
+static const uintptr_t RVA_APPLY_COUNT      = 0x08F373;   // movsxd rdi,[rsi+0x34]: the touched-class list's count
+static const uintptr_t RVA_APPLY_DATA       = 0x08F37B;   // mov rax,[rsi+0x2c]: its data
+static const uintptr_t RVA_TICK_LOADMAP     = 0x550A53;   // call [rax+0x3e8]: UGameEngine::Tick's LoadMap(URL, Pending, Error)
+static const size_t    SLOT_LOADMAP    = 0x3E8 / 8;
+static const size_t    OFF_URL_MAP     = 0x20;   // FURL: Protocol, Host, Map (FStrings), Op, Portal, then Port:
+                                                 // LE3's order (GameEngine.uc's URL struct), not stock UE3's,
+                                                 // where Port comes before Map; the exe's LoadMap reads [URL+0x20]
+static const size_t    OFF_CFG_LAYERS  = 0x0C;   // TArray of 16-byte {INT Priority; layer*}
+static const size_t    OFF_CFG_TOUCHED = 0x2C;   // TArray<UClass*>, appended by AddLayer/RemoveLayer's apply step
+static const size_t    OFF_LAYER_NAME  = 0x08;   // FString
+// LoadConfig flags, as RELOADCONFIG passes them: read the parent classes'
+// sections (1), reloading (8). Children's defaults and live objects are
+// reached by one walk here, not by the engine's per-class walks.
+static const uint32_t  LOADCONFIG_FLAGS = 0x9;
+
+typedef void* (*AddLayerFn)(void* config, const uint8_t* data, const char16_t* name, int64_t priority, int32_t apply);
+typedef void  (*RemoveLayerFn)(void* config, void* layer, int32_t apply);
+typedef void  (*LoadConfigFn)(UObject* self, UObject* configClass, const char16_t* file, uint32_t flags, void* prop);
+typedef int   (*LoadMapFn)(void* self, void* url, void* pending, void* error);
+
+static int                  g_layerCode = 0;    // 0 not checked, 1 verified, -1 refused
+static std::vector<uint8_t> g_layerBuf;         // the engine keeps pointers into it: never freed
+static void*                g_layer = nullptr;
+static LoadMapFn            g_origLoadMap = nullptr;
+
+static bool LeaR8To(uintptr_t rva, const char16_t* want) {
+    uint8_t* at = g_base + rva;
+    if (at + 7 > g_end || IsBadReadPtr(at, 7) || at[0] != 0x4C || at[1] != 0x8D || at[2] != 0x05) return false;
+    const char16_t* s = (const char16_t*)RelTarget(at, 7, 3);
+    size_t n = 0; while (want[n]) ++n;
+    if (!s || (uint8_t*)s < g_base || (uint8_t*)(s + n + 1) > g_end || IsBadReadPtr(s, (n + 1) * 2)) return false;
+    return memcmp(s, want, (n + 1) * 2) == 0;
+}
+static bool MovRcxFrom(uintptr_t rva, uintptr_t targetRva) {
+    uint8_t* at = g_base + rva;
+    if (at + 7 > g_end || IsBadReadPtr(at, 7) || at[0] != 0x48 || at[1] != 0x8B || at[2] != 0x0D) return false;
+    return RelTarget(at, 7, 3) == g_base + targetRva;
+}
+static bool BytesAt(uintptr_t rva, const uint8_t* want, size_t n) {
+    uint8_t* at = g_base + rva;
+    return at + n <= g_end && !IsBadReadPtr(at, n) && memcmp(at, want, n) == 0;
+}
+static bool VerifyLayerCode() {
+    if (g_layerCode) return g_layerCode > 0;
+    static const uint8_t cnt[] = {0x48, 0x63, 0x7E, 0x34}, dat[] = {0x48, 0x8B, 0x46, 0x2C};
+    bool ok = LeaR8To(RVA_LIVEINI_NAME_LEA, u"LiveINI") && MovRcxFrom(RVA_LIVEINI_GCONFIG, RVA_GCONFIG)
+           && CallTo(RVA_LIVEINI_ADD, RVA_ADD_LAYER) && CallTo(RVA_LIVEINI_REMOVE, RVA_REMOVE_LAYER)
+           && LeaRdxTo(RVA_RELOADCFG_LEA, u"RELOADCONFIG") && CallTo(RVA_RELOADCFG_CALL, RVA_LOAD_CONFIG)
+           && BytesAt(RVA_APPLY_COUNT, cnt, 4) && BytesAt(RVA_APPLY_DATA, dat, 4);
+    g_layerCode = ok ? 1 : -1;
+    L("layer: config layer code %s", ok ? "verified" : "NOT as expected in this exe; no MP balance layer");
+    return ok;
+}
+static void* GConfigPtr() {
+    void** p = (void**)(g_base + RVA_GCONFIG);
+    return IsBadReadPtr(p, 8) ? nullptr : *p;
+}
+static std::string Narrow(const std::u16string& s) { return std::string(s.begin(), s.end()); }
+
+static std::string LayerList() {
+    uint8_t* cfg = (uint8_t*)GConfigPtr();
+    if (!cfg || IsBadReadPtr(cfg + OFF_CFG_LAYERS, 12)) return "no GConfig";
+    TArray<uint8_t> a; memcpy(&a, cfg + OFF_CFG_LAYERS, sizeof(a));
+    std::string line = std::to_string(a.Count) + ":";
+    for (int i = 0; i < a.Count && i < 64; ++i) {
+        uint8_t* e = a.Data + 16 * i;
+        if (IsBadReadPtr(e, 16)) break;
+        int32_t prio; void* layer; memcpy(&prio, e, 4); memcpy(&layer, e + 8, 8);
+        std::u16string name; std::string why;
+        if (!layer || IsBadReadPtr((uint8_t*)layer + OFF_LAYER_NAME, 16)
+            || !ReadFString((FStringRaw*)((uint8_t*)layer + OFF_LAYER_NAME), name, why)) name = u"?";
+        std::string n = Narrow(name);
+        size_t slash = n.find_last_of('\\');
+        if (slash != std::string::npos) n = n.substr(slash + 1);
+        line += " " + n + "(" + std::to_string(prio) + ")";
+    }
+    return line;
+}
+static std::vector<UObject*> TouchedClasses() {
+    std::vector<UObject*> out;
+    uint8_t* cfg = (uint8_t*)GConfigPtr();
+    if (!cfg || IsBadReadPtr(cfg + OFF_CFG_TOUCHED, 12)) return out;
+    UObject** data; int32_t n;
+    memcpy(&data, cfg + OFF_CFG_TOUCHED, 8); memcpy(&n, cfg + OFF_CFG_TOUCHED + 8, 4);
+    for (int i = 0; i < n && i < 4096; ++i)
+        if (!IsBadReadPtr(data + i, 8) && data[i] && !IsBadReadPtr(data[i], sizeof(UObject))) out.push_back(data[i]);
+    return out;
+}
+// The pistol base's mod list as GET prints it: entries, and whether MP5's
+// Power Magnifier (only in the layer's list) is in it.
+static std::string PistolModList() {
+    if (!VerifySetCommand()) return "?";
+    g_execDispatch(u"GET SFXWeapon_Pistol_Base AllowableWeaponMods", Device());
+    std::string v = Narrow(g_capture);
+    int n = v.empty() ? 0 : 1; for (char c : v) n += c == ',';
+    return std::to_string(n) + " entries, MP5 " + (v.find("PistolPowerDamage_MP5") != std::string::npos ? "in" : "absent");
+}
+// Config loaded again for every class default and live object whose class is
+// one of the touched classes or under one: what UE3's propagation flags do with
+// one walk per class, done here with one walk for all.
+static void ReloadTouched(const char* when) {
+    std::vector<UObject*> touched = TouchedClasses();
+    std::unordered_set<UObject*> roots(touched.begin(), touched.end());
+    std::unordered_map<UObject*, bool> under;
+    auto isUnder = [&](UObject* cls) {
+        auto it = under.find(cls);
+        if (it != under.end()) return it->second;
+        bool r = false;
+        for (UObject* c = cls; c && !IsBadReadPtr(c, 0x80) && !r; c = *(UObject**)((uint8_t*)c + OFF_FIELD_SUPER))
+            r = roots.count(c) != 0;
+        under[cls] = r;
+        return r;
+    };
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    auto loadConfig = (LoadConfigFn)(g_base + RVA_LOAD_CONFIG);
+    int defaults = 0, objects = 0;
+    int count = (!roots.empty() && g_objs && !IsBadReadPtr(g_objs, sizeof(*g_objs))) ? g_objs->Count : 0;
+    for (int i = 0; i < count; ++i) {
+        UObject* o = SlotAt(g_objs, i);
+        if (!o || IsBadReadPtr(o, sizeof(UObject)) || !o->Class || IsBadReadPtr(o->Class, 0x80)) continue;
+        if (!isUnder(o->Class)) continue;
+        loadConfig(o, nullptr, nullptr, LOADCONFIG_FLAGS, nullptr);
+        (strncmp(NameOf(o->Name), "Default__", 9) == 0 ? defaults : objects)++;
+    }
+    QueryPerformanceCounter(&t1);
+    L("layer: %s: %zu loaded class(es) named by it, config loaded again on %d default(s) and %d object(s) in %.1f ms",
+      when, touched.size(), defaults, objects, QpcMicros(t0, t1) / 1000.0);
+}
+
+// The DLC's CookedPCConsole, from the exe's path (...\Game\ME3\Binaries\Win64).
+static std::wstring LayerPath() {
+    wchar_t exe[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring p = exe;
+    for (int up = 0; up < 3; ++up) p = p.substr(0, p.find_last_of(L'\\'));
+    return p + L"\\BioGame\\DLC\\DLC_MOD_LEMultiplayer\\CookedPCConsole\\LEMPBalance.bin";
+}
+// 0 on, 1 off (the control), 2 refused (this exe), 3 no file.
+static int LayerOn(const char* why) {
+    if (g_layer) return 0;
+    static bool controlLogged = false, fileLogged = false;
+    if (GetFileAttributesW((LempDir() + L"\\nobalancelayer.txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!controlLogged) L("layer: nobalancelayer.txt: no MP balance layer (%s)", why);
+        controlLogged = true;
+        return 1;
+    }
+    if (!VerifyLayerCode() || !GConfigPtr()) return 2;
+    if (g_layerBuf.empty()) {
+        std::wstring path = LayerPath();
+        FILE* f = _wfopen(path.c_str(), L"rb");
+        long size = 0;
+        if (f) {
+            fseek(f, 0, SEEK_END); size = ftell(f); fseek(f, 0, SEEK_SET);
+            if (size > 32) {
+                g_layerBuf.resize((size_t)size);
+                if (fread(g_layerBuf.data(), 1, (size_t)size, f) != (size_t)size || memcmp(g_layerBuf.data(), "mrmf", 4) != 0)
+                    g_layerBuf.clear();
+            }
+            fclose(f);
+        }
+        if (g_layerBuf.empty()) {
+            if (!fileLogged) L("layer: %ls missing or not a coalesced file (%ld bytes): no MP balance layer", path.c_str(), size);
+            fileLogged = true;
+            return 3;
+        }
+    }
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    g_layer = ((AddLayerFn)(g_base + RVA_ADD_LAYER))(GConfigPtr(), g_layerBuf.data(), u"LEMPBalance", 3, 1);
+    QueryPerformanceCounter(&t1);
+    if (!g_layer) { L("layer: AddLayer returned null (%s)", why); return 2; }
+    L("layer: on (%s), %zu bytes, AddLayer %.1f ms; layers %s", why, g_layerBuf.size(), QpcMicros(t0, t1) / 1000.0, LayerList().c_str());
+    ReloadTouched("on");
+    L("layer: on: pistol base mod list %s", PistolModList().c_str());
+    return 0;
+}
+static void LayerOff(const char* why) {
+    if (!g_layer) return;
+    ((RemoveLayerFn)(g_base + RVA_REMOVE_LAYER))(GConfigPtr(), g_layer, 1);
+    g_layer = nullptr;
+    L("layer: off (%s); layers %s", why, LayerList().c_str());
+    ReloadTouched("off");
+    L("layer: off: pistol base mod list %s", PistolModList().c_str());
+}
+
+// The map a LoadMap is about to load, from its FURL; "" if it does not read
+// as a map name.
+static std::string UrlMap(void* url) {
+    if (!url || IsBadReadPtr((uint8_t*)url + OFF_URL_MAP, 16)) return "";
+    FStringRaw* s = (FStringRaw*)((uint8_t*)url + OFF_URL_MAP);
+    std::u16string m; std::string why;
+    if (!ReadFString(s, m, why) || m.empty() || m.size() > 128) return "";
+    for (char16_t c : m)
+        if (!(c == u'_' || c == u'-' || c == u'.' || (c >= u'0' && c <= u'9') || (c >= u'A' && c <= u'Z') || (c >= u'a' && c <= u'z'))) return "";
+    return Narrow(m);
+}
+static bool IsMpMap(const std::string& m) {
+    return _stricmp(m.c_str(), "MPLobby") == 0 || _strnicmp(m.c_str(), "BioP_MP", 7) == 0;
+}
+static int HookLoadMap(void* self, void* url, void* pending, void* error) {
+    std::string map = UrlMap(url);
+    if (map.empty()) {
+        // Off: an MP map's GRI turns the layer on again (op 78); left on, it
+        // would stay on for whatever loads next, the campaign included.
+        static int unread = 0;
+        if (unread++ < 3) L("layer: LoadMap: the map name does not read; layer off");
+        LayerOff("a LoadMap whose map name does not read");
+    } else if (IsMpMap(map)) {
+        std::string why = "loading " + map;
+        LayerOn(why.c_str());
+    } else {
+        std::string why = "loading " + map;
+        LayerOff(why.c_str());
+    }
+    return g_origLoadMap(self, url, pending, error);
+}
+// GEngine's LoadMap slot, once GEngine exists. The slot is the one
+// UGameEngine::Tick calls for a travel; checked at that call site.
+static DWORD WINAPI LoadMapHookThread(LPVOID) {
+    static const uint8_t call3e8[] = {0xFF, 0x90, 0xE8, 0x03, 0x00, 0x00};
+    if (!BytesAt(RVA_TICK_LOADMAP, call3e8, sizeof(call3e8))) {
+        L("layer: UGameEngine::Tick's LoadMap call NOT as expected; the layer follows the GRI only (op 78)");
+        return 0;
+    }
+    for (int t = 0; t < 2400; ++t) {
+        if (lemp::Exiting()) return 0;
+        void** pge = (void**)(g_base + RVA_GENGINE);
+        void* ge = (!IsBadReadPtr(pge, 8)) ? *pge : nullptr;
+        if (ge && !IsBadReadPtr(ge, 8)) {
+            void** vt = *(void***)ge;
+            void* cur = IsBadReadPtr(vt + SLOT_LOADMAP, 8) ? nullptr : vt[SLOT_LOADMAP];
+            // The exe's own LoadMap, or loadmap_hook.cpp's diagnostic hook
+            // (this module, debug mode), which forwards every call to the
+            // exe's: chained, since a refusal here would leave the layer on
+            // after the first MP map with nothing to take it off. Anything
+            // else (another mod's code) is still refused.
+            bool inExe = cur && (uint8_t*)cur >= g_base && (uint8_t*)cur < g_end;
+            HMODULE self = nullptr, owner = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)&HookLoadMap, &self);
+            if (cur && !inExe)
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)cur, &owner);
+            bool ours = !inExe && self && owner == self;
+            if (!inExe && !ours) {
+                L("layer: GEngine's LoadMap slot reads %p: not hooked; the layer follows the GRI only (op 78)", cur);
+                return 0;
+            }
+            DWORD old;
+            if (!VirtualProtect(vt + SLOT_LOADMAP, 8, PAGE_READWRITE, &old)) { L("layer: VirtualProtect (%lu)", GetLastError()); return 0; }
+            // Set before the swap (the game thread may call it at once); the
+            // swap only if the slot still holds what was read, else read again.
+            g_origLoadMap = (LoadMapFn)cur;
+            bool swapped = InterlockedCompareExchangePointer(vt + SLOT_LOADMAP, (void*)&HookLoadMap, cur) == cur;
+            VirtualProtect(vt + SLOT_LOADMAP, 8, old, &old);
+            if (!swapped) { Sleep(250); continue; }
+            if (inExe)
+                L("layer: HOOKED GEngine LoadMap (slot %zu, was rva 0x%llx): the MP balance layer follows the map",
+                  SLOT_LOADMAP, (unsigned long long)((uint8_t*)cur - g_base));
+            else
+                L("layer: HOOKED GEngine LoadMap (slot %zu, chained onto this module's diagnostic hook at %p): the MP balance layer follows the map",
+                  SLOT_LOADMAP, cur);
+            return 0;
+        }
+        Sleep(250);
+    }
+    L("layer: GEngine never set: the layer follows the GRI only (op 78)");
+    return 0;
+}
+
+// Op 78, from SFXGRIMP when an MP map's GRI begins play: the layer on.
+static void ServeLayer(UObject* self) {
+    int32_t* result = IntProp(self, "AsiResult");
+    if (!result) { L("layer: SFXMPLocalSave has no AsiResult"); return; }
+    *result = LayerOn("an MP map's GRI");
+}
+
+// ---------------------------------------------------------------------------
+// The field of view (ops 72/73): SFXPlayerCameraMP reads it when it spawns
+// and writes it from the `fov` command and the options row. One line,
+// LEMP\camera.txt "fov=<70..110>"; a machine setting like voice.txt, so it
+// stays out of the synced Save\ME3. No file, or a value out of range: 70,
+// the game's own.
+
+static const int kFovDefault = 70, kFovMin = 70, kFovMax = 110;
+static int g_fov = -1;   // -1: not read yet
+
+static std::wstring CameraPath() { return LempDir() + L"\\camera.txt"; }
+
+static int ReadFov() {
+    if (g_fov >= 0) return g_fov;
+    g_fov = kFovDefault;
+    if (FILE* f = _wfopen(CameraPath().c_str(), L"r")) {
+        int v = 0;
+        if (fscanf(f, " fov=%d", &v) == 1 && v >= kFovMin && v <= kFovMax) g_fov = v;
+        fclose(f);
+    }
+    L("camera: fov %d", g_fov);
+    return g_fov;
+}
+
+static void ServeCamera(UObject* self) {
+    int32_t* op = IntProp(self, "AsiOp");
+    int32_t* idx = IntProp(self, "AsiIndex");
+    int32_t* result = IntProp(self, "AsiResult");
+    if (!op || !idx || !result) { L("camera: SFXMPLocalSave has no AsiOp/AsiIndex/AsiResult"); return; }
+    // The control: LEMP\nofov.txt refuses both ops, and the camera is LE3's.
+    if (GetFileAttributesW((LempDir() + L"\\nofov.txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        L("camera: nofov.txt, op %d refused", *op); *result = 3; return;
+    }
+    if (*op == 72) { *idx = ReadFov(); *result = 0; return; }
+    int v = *idx < kFovMin ? kFovMin : *idx > kFovMax ? kFovMax : *idx;
+    g_fov = v;
+    FILE* f = _wfopen(CameraPath().c_str(), L"w");
+    if (!f) { L("camera: could not write camera.txt"); *result = 1; return; }
+    fprintf(f, "fov=%d\n", v);
+    fclose(f);
+    L("camera: fov %d saved", v);
+    *result = 0;
+}
+
+// ---------------------------------------------------------------------------
+// The log row (ops 74/75, SFXGUI_Option_MPLog): 74 reads whether the log is on
+// (AsiIndex 1/0), 75 sets it from AsiIndex. lemp.cpp keeps the setting
+// (LEMP\nodebug.txt) and starts or stops this launch's lines.
+
+// The Consistent Mouse Speed row (ops 76/77): on unless LEMP\nomouserate.txt
+// exists. 76 reads it into AsiIndex (1 on, 0 off); 77 writes AsiIndex (0
+// creates the file, 1 deletes it). The script scales the mouse dampening
+// curve by the frame time while it is on.
+static std::wstring MouseRatePath() { return LempDir() + L"\\nomouserate.txt"; }
+static void ServeMouse(UObject* self) {
+    int32_t* op = IntProp(self, "AsiOp");
+    int32_t* idx = IntProp(self, "AsiIndex");
+    int32_t* result = IntProp(self, "AsiResult");
+    if (!op || !idx || !result) { L("mouse row: SFXMPLocalSave has no AsiOp/AsiIndex/AsiResult"); return; }
+    if (*op == 76) {
+        *idx = GetFileAttributesW(MouseRatePath().c_str()) == INVALID_FILE_ATTRIBUTES ? 1 : 0;
+        *result = 0;
+        return;
+    }
+    if (*idx != 0) {
+        *result = (DeleteFileW(MouseRatePath().c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) ? 0 : 1;
+    } else {
+        HANDLE h = CreateFileW(MouseRatePath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        *result = h != INVALID_HANDLE_VALUE ? 0 : 1;
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+    L("mouse row: consistent mouse speed %s", *idx != 0 ? "on" : "off");
+}
+
+static void ServeLog(UObject* self) {
+    int32_t* op = IntProp(self, "AsiOp");
+    int32_t* idx = IntProp(self, "AsiIndex");
+    int32_t* result = IntProp(self, "AsiResult");
+    if (!op || !idx || !result) { L("log row: SFXMPLocalSave has no AsiOp/AsiIndex/AsiResult"); return; }
+    if (*op == 74) { *idx = LempLogOn() ? 1 : 0; *result = 0; return; }
+    *result = LempSetLogOn(*idx != 0) ? 0 : 1;
+}
+
+// What ops 57-59 cost on the game thread, logged per 500 ops: the engine's
+// own SaveConfig (which every op runs first; this class is config) apart from
+// the serving. SFXGRIMP's balance retry makes these calls during play, so
+// their cost is a frame-time cost.
+struct BalanceTiming { int n = 0; double cfgSum = 0, cfgMax = 0, serveSum = 0, serveMax = 0; };
+static BalanceTiming g_balTiming;
+static double QpcMicros(LARGE_INTEGER a, LARGE_INTEGER b) {
+    static LARGE_INTEGER f = {};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    return (double)(b.QuadPart - a.QuadPart) * 1e6 / (double)f.QuadPart;
+}
+static void NoteBalanceTiming(double cfgUs, double serveUs) {
+    BalanceTiming& t = g_balTiming;
+    ++t.n; t.cfgSum += cfgUs; t.serveSum += serveUs;
+    if (cfgUs > t.cfgMax) t.cfgMax = cfgUs;
+    if (serveUs > t.serveMax) t.serveMax = serveUs;
+    if (t.n < 500) return;
+    L("balance: timing: %d ops 57-59, SaveConfig avg %.0f us (max %.0f), serve avg %.0f us (max %.0f)",
+      t.n, t.cfgSum / t.n, t.cfgMax, t.serveSum / t.n, t.serveMax);
+    t = BalanceTiming();
+}
+
 static void HookSaveConfig(UObject* self, void* stack, void* result) {
+    LARGE_INTEGER t0, t1, t2;
+    QueryPerformanceCounter(&t0);
     g_origSaveConfig(self, stack, result);
+    QueryPerformanceCounter(&t1);
     if (!self || IsBadReadPtr(self, sizeof(UObject))) return;
     const char* cls = ClassNameOf(self);
     if (_stricmp(cls, "SFXMPLocalSave") == 0) {
@@ -987,14 +1861,24 @@ static void HookSaveConfig(UObject* self, void* stack, void* result) {
         else if (op && (*op == 5 || *op == 6 || *op == 11 || *op == 12 || *op == 13 || *op == 14)) ServeName(self);
         else if (op && ((*op >= 20 && *op <= 38) || (*op >= 42 && *op <= 44) || *op == 53 || *op == 54)) ServeOnline(self);
         else if (op && *op >= 45 && *op <= 49) ServePackages(self);
+        else if (op && *op >= 57 && *op <= 59) {
+            ServeBalance(self);
+            QueryPerformanceCounter(&t2);
+            NoteBalanceTiming(QpcMicros(t0, t1), QpcMicros(t1, t2));
+        }
+        else if (op && (*op == 72 || *op == 73)) ServeCamera(self);
+        else if (op && (*op == 74 || *op == 75)) ServeLog(self);
+        else if (op && (*op == 76 || *op == 77)) ServeMouse(self);
+        else if (op && *op == 78) ServeLayer(self);
         else Serve(self);
     }
     else if (_stricmp(cls, "SFXMPProfileName") == 0) {
         int32_t* op = IntProp(self, "AsiOp");
         // The online statistics, the release check and lemp.asi's release (no
-        // AsiIndex needed); a code join's search, 20-25 (21 needs its AsiIndex).
-        if (op && (*op == 32 || *op == 33 || (*op >= 39 && *op <= 41) || *op == 55 || *op == 56 || (*op >= 20 && *op <= 25))) ServeOnline(self);
-        else if (op && *op >= 50 && *op <= 52) ServeImport(self);
+        // AsiIndex needed); a code join's search, 20-25 (21 needs its AsiIndex);
+        // a line for this log, 31.
+        if (op && (*op == 31 || *op == 32 || *op == 33 || (*op >= 39 && *op <= 41) || *op == 55 || *op == 56 || (*op >= 20 && *op <= 25))) ServeOnline(self);
+        else if (op && *op >= 50 && *op <= 53) ServeImport(self);
         else ServeName(self);
     }
 }
@@ -1082,6 +1966,7 @@ static bool Install(TArray<UObject*>* objs) {
     *funcSlot = (void*)&HookSaveConfig;   // the UFunction path too, whichever the VM takes
     L("HOOKED: SaveConfig (GNatives rva 0x%llx [%d], and its UFunction). Save file: %ls",
       (unsigned long long)((uint8_t*)gnatives - g_base), SAVECONFIG_NATIVE, SavePath().c_str());
+    CloseHandle(CreateThread(nullptr, 0, LoadMapHookThread, nullptr, 0, nullptr));
     return true;
 }
 
@@ -1093,11 +1978,6 @@ static DWORD WINAPI Thread(LPVOID) {
     CreateDirectoryW(g_cloud.c_str(), nullptr);
     g_cloud += L"\\ME3";
     CreateDirectoryW(g_cloud.c_str(), nullptr);
-    // One file per run, so a launch never erases the previous run's log (how
-    // earlier runs' saves were lost to diagnosis, when it
-    // was one file truncated at each start). Debug mode only (lemp.h).
-    g_log = LempOpenDebugLog("mp_save");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     uint32_t peOff = *(uint32_t*)(g_base + 0x3C);

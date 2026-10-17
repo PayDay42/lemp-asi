@@ -86,6 +86,8 @@ public:
 
     bool Connect() {
         Close();
+        err.clear();
+        buf_.clear();   // a reconnect starts clean: nothing left of the dropped connection
         s_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s_ == EA_BADSOCK) return Fail("no socket");
 #ifdef _WIN32

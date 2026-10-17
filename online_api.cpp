@@ -75,21 +75,13 @@ typedef void* (*StaticClassFn)();
 typedef void* (*GetIfaceAddrFn)(void* obj, void* ifaceClass);
 
 static uint8_t*       g_base = nullptr;
-static FILE*          g_log  = nullptr;
 static StaticClassFn  g_ifaceClass = nullptr;
 static GetIfaceAddrFn g_ifaceAddr  = nullptr;
 static volatile LONG  g_standinUses = 0;
 
 static void L(const char* fmt, ...) {
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, a);
-        fputc('\n', g_log);
-        fflush(g_log);
-    }
+    LempLogV("online_api", fmt, a);
     va_end(a);
 }
 
@@ -140,8 +132,6 @@ static IfacePair* GetComponentAPI(uint8_t* subsystem, IfacePair* out) {
 // --- install ---------------------------------------------------------------
 
 static DWORD WINAPI Thread(LPVOID) {
-    g_log = LempOpenDebugLog("online_api");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
 

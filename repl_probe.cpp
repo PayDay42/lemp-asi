@@ -198,32 +198,19 @@ static inline UObject* SlotAt(TArray<UObject*>* a, int i) {
 static uint8_t*     g_base = nullptr;
 static uint8_t*     g_end  = nullptr;
 static FNameEntry** g_pools = nullptr;
-static FILE*        g_log = nullptr;
 static UObject* volatile g_stallWI = nullptr;   // see StallThread
 static volatile size_t   g_stallOff = 0;
 
-// One line per call, whole: StallThread logs alongside the sampler.
-static SRWLOCK g_logLock = SRWLOCK_INIT;
+// One line per call, whole (LempLogV): StallThread logs alongside the sampler.
+static volatile bool g_logDone = false;
 static void L(const char* fmt, ...) {
-    SYSTEMTIME st; GetLocalTime(&st);
+    if (g_logDone) return;
     va_list a; va_start(a, fmt);
-    AcquireSRWLockExclusive(&g_logLock);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, a);
-        fputc('\n', g_log);
-        fflush(g_log);
-    }
-    ReleaseSRWLockExclusive(&g_logLock);
+    LempLogV("repl_probe", fmt, a);
     va_end(a);
 }
-static void CloseLog() {
-    AcquireSRWLockExclusive(&g_logLock);
-    if (g_log) fclose(g_log);
-    g_log = nullptr;
-    ReleaseSRWLockExclusive(&g_logLock);
-}
+// The probe is finished: its lines stop (the session's log goes on).
+static void CloseLog() { g_logDone = true; }
 static const char* NameOf(const FName& n) {
     if (!g_pools || n.Chunk > 7) return "<bad>";
     FNameEntry* c = g_pools[n.Chunk];
@@ -2357,12 +2344,6 @@ static Snapshot Sample(TArray<UObject*>* objs) {
 }
 
 static void Probe() {
-    // The pid alone is not enough to keep two instances' logs apart: Windows
-    // pids are per-wineserver and the two instances run in separate prefixes,
-    // so both came up as pid 312 and wrote one interleaved, torn file, misread
-    // more than once. LempOpenDebugLog appends a tick count.
-    g_log = LempOpenDebugLog("repl_probe");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     uint32_t peOff = *(uint32_t*)(g_base + 0x3C);

@@ -51,18 +51,10 @@ static const size_t    SLOT_PROGRESS = 0x2E0 / 8;  // 92
 static const DWORD     START_DELAY_MS = 15000;
 
 static uint8_t* g_base = nullptr;
-static FILE*    g_log  = nullptr;
 
 static void L(const char* fmt, ...) {
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, a);
-        fputc('\n', g_log);
-        fflush(g_log);
-    }
+    LempLogV("loadmap_hook", fmt, a);
     va_end(a);
 }
 
@@ -116,8 +108,17 @@ static bool hook(void** vt, size_t slot, void* thunk, void** orig, const char* n
     if (!VirtualProtect(vt + slot, 8, PAGE_READWRITE, &old)) {
         L("FAIL: %s VirtualProtect %lu", name, GetLastError()); return false;
     }
+    // mp_save.cpp hooks the LoadMap slot too, from its own thread: the swap
+    // only if the slot still holds what was read, so neither hook is lost.
     *orig = o;
-    vt[slot] = thunk;
+    for (int tries = 0; InterlockedCompareExchangePointer(vt + slot, thunk, o) != o; ++tries) {
+        o = vt[slot];
+        if (tries == 3 || !o || (uint8_t*)o < g_base) {
+            VirtualProtect(vt + slot, 8, old, &old);
+            L("FAIL: %s slot changed while hooking (%p)", name, o); return false;
+        }
+        *orig = o;
+    }
     VirtualProtect(vt + slot, 8, old, &old);
     L("hooked %s: slot %zu was rva %llx", name, slot,
       (unsigned long long)((uint8_t*)o - g_base));
@@ -125,8 +126,6 @@ static bool hook(void** vt, size_t slot, void* thunk, void** orig, const char* n
 }
 
 static DWORD WINAPI Thread(LPVOID) {
-    g_log = LempOpenDebugLog("loadmap_hook");
-
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     L("== loadmap_hook ==  pid %lu  base %p", GetCurrentProcessId(), (void*)g_base);

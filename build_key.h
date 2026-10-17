@@ -202,6 +202,86 @@ inline std::string JoinOptions(const std::string& shortKey, const std::string& g
            "?LEMPBase=" + base + "?LEMPMods=" + (mods.empty() ? "none" : mods);
 }
 
+// kBaseFiles as an unmodified LE3 install holds them, for the exe version
+// LEMP is built for: what LEMPBase hashes to 59ba2c5b, so the files a mod
+// changed can be named (DifferentBaseFiles). Sizes and hashes only.
+struct BaseExpect { const char* rel; const char* name; uint64_t size; const char* sha; };
+inline const char kBaseGameVersion[] = "2.0.0.48602";
+inline const BaseExpect kBaseExpected[] = {
+    {"biogame/cookedpcconsole/coalesced.bin", "Coalesced.bin", 1430346, "0f50f9cefa503a29b1b1ff2be9967ebe76aaf9d82f5679068c60237cecf7f94a"},
+    {"biogame/cookedpcconsole/core.pcc", "Core.pcc", 24554, "8d550cd069d32eb688fcda5e49b255d5e36e953ae4ddfd05a127ec7fe0718ed5"},
+    {"biogame/cookedpcconsole/engine.pcc", "Engine.pcc", 1656013, "47e5ddb7329c7fed1c5da108ee8620b962e1488575d1b531febb9402f5b296e5"},
+    {"biogame/cookedpcconsole/gameframework.pcc", "GameFramework.pcc", 9499, "68e566820f2425f395fd6bb5e4b89074b026b3b3d021ed81847da62ec1d5a85a"},
+    {"biogame/cookedpcconsole/gfxui.pcc", "GFxUI.pcc", 12739, "d1215e120906c5aecfea35bb9d281d0de28e7ec5756a6b56e7f4662aed4e41cf"},
+    {"biogame/cookedpcconsole/ipdrv.pcc", "IpDrv.pcc", 28790, "7ab9bba080d7557304d5c6ad74fd12a1fb6abd40fdecc51553b11d7d63cbc674"},
+    {"biogame/cookedpcconsole/sfxautobots.pcc", "SFXAutoBots.pcc", 11456, "557d069afead5767c07be6552c9dbb74b036286021ec3aa270bc0a7a6fdbf315"},
+    {"biogame/cookedpcconsole/sfxgame.pcc", "SFXGame.pcc", 18676091, "1d8f7acb6f28e78030982c9f2d935cddec16877272aba314ce1c21dff5ed2d18"},
+    {"biogame/cookedpcconsole/sfxgameeffects.pcc", "SFXGameEffects.pcc", 4037, "5c3eb44c602e99b3ccc2a1bcfd397d9b6ef856b1ad092f29a16569b5cceb80fd"},
+    {"biogame/cookedpcconsole/sfxonlinefoundation.pcc", "SFXOnlineFoundation.pcc", 116711, "2bdd9a713b26b1bfb0634fee0a7c7406ac54237b8b55d0c0170c40da4ed51b09"},
+    {"biogame/cookedpcconsole/wwiseaudio.pcc", "WwiseAudio.pcc", 254809, "3a2bb86082307f8f02a910ffd048eab0d9375c65eaecbaf7134814193e7a2cec"},
+};
+
+// The base files that differ from kBaseExpected (other size or hash, or
+// missing: sha ""), by name, ',' between; "" when none. got: the entries
+// HashFileList filled for kBaseFiles.
+inline std::string DifferentBaseFiles(const std::vector<Entry>& got) {
+    std::string out;
+    for (const BaseExpect& x : kBaseExpected) {
+        bool same = false;
+        for (const Entry& e : got)
+            if (e.rel == x.rel) { same = e.size == x.size && e.sha == x.sha; break; }
+        if (!same) out += (out.empty() ? "" : ",") + std::string(x.name);
+    }
+    return out;
+}
+
+// The Multiplayer screen's notice for an install matchmaking can pair only
+// with its exact copies: two lines (the game's message box holds two of ~68
+// characters, '\n' between), "" for a plain install. mods: LEMPMods' list
+// ("" none); base: DifferentBaseFiles ("" none, or not known: another exe
+// version). Names drop their DLC_MOD_ prefix; a list too long for line 2
+// keeps its first names and "+N more", the mods giving way first.
+inline const size_t kNoticeLine = 68;
+inline std::string ModsNotice(const std::string& mods, const std::string& base) {
+    auto split = [](const std::string& s) {
+        std::vector<std::string> v;
+        for (size_t at = 0; at < s.size();) {
+            size_t comma = s.find(',', at);
+            if (comma == std::string::npos) comma = s.size();
+            std::string n = s.substr(at, comma - at);
+            if (n.compare(0, 8, "DLC_MOD_") == 0 && n.size() > 8) n = n.substr(8);
+            if (!n.empty()) v.push_back(n);
+            at = comma + 1;
+        }
+        return v;
+    };
+    std::vector<std::string> m = split(mods), b = split(base);
+    if (m.empty() && b.empty()) return "";
+    auto list = [](const std::vector<std::string>& v, size_t shown) {
+        std::string s;
+        for (size_t i = 0; i < shown; ++i) s += (i ? ", " : "") + v[i];
+        if (shown < v.size()) s += (shown ? ", +" : "+") + std::to_string(v.size() - shown) + " more";
+        return s;
+    };
+    auto line = [&](size_t sm, size_t sb) {
+        std::string s;
+        if (!m.empty()) s = "Mods: " + list(m, sm);
+        if (!b.empty()) s += (s.empty() ? "" : ". ") + std::string("Changed: ") + list(b, sb);
+        return s;
+    };
+    size_t sm = m.size(), sb = b.size();
+    std::string two = line(sm, sb);
+    while (two.size() > kNoticeLine && (sm > 0 || sb > 0)) {
+        if (sm > (b.empty() ? 0u : 1u) || (sm > 0 && sb == 0)) --sm;
+        else --sb;
+        two = line(sm, sb);
+    }
+    std::string one = m.empty() ? "Matchmaking only finds players with the same changed game files:"
+                    : b.empty() ? "Matchmaking only finds players with the same other mods as you:"
+                                : "Matchmaking only finds players with the same mods and game files:";
+    return one + "\n" + two;
+}
+
 #ifdef _WIN32
 inline std::string Utf8Lower(const std::wstring& w) {
     std::string s;
@@ -309,7 +389,9 @@ inline std::string ComputeKey(const std::wstring& dlcDir, HashCache& cache, std:
 
 // ListHash over files named relative to gameDir (Game\ME3). The cache keys
 // are these names, which cannot collide with the DLC's ("cookedpcconsole/...").
-inline std::string HashFileList(const std::wstring& gameDir, const char* const* rels, size_t n, HashCache& cache) {
+// out, if given: the entries, a missing file with sha "" (DifferentBaseFiles).
+inline std::string HashFileList(const std::wstring& gameDir, const char* const* rels, size_t n, HashCache& cache,
+                                std::vector<Entry>* out = nullptr) {
     std::vector<Entry> got(n);
     std::vector<std::pair<std::string, const Entry*>> files;
     for (size_t i = 0; i < n; ++i) {
@@ -318,7 +400,9 @@ inline std::string HashFileList(const std::wstring& gameDir, const char* const* 
         got[i].rel = rels[i];
         std::string why;
         files.push_back({rels[i], cache.Hash(gameDir + L"\\" + w, got[i], why) ? &got[i] : nullptr});
+        if (!files.back().second) got[i].sha.clear();
     }
+    if (out) *out = got;
     return ListHash(files);
 }
 

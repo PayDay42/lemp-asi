@@ -1,21 +1,27 @@
-// lemp.h — what the modules of lemp.asi share: where logs go, debug mode, and
+// lemp.h — what the modules of lemp.asi share: the log, debug mode, and
 // each module's entry point (lemp.cpp calls them from the one DllMain).
 //
 // lemp.asi is the eight ASIs that shipped up to 0.1.5, one file each, linked
 // into one DLL: crashes are always logged, and debug mode logs everything.
-// Each module is unchanged
-// apart from its entry point and where it opens its log; they still share no
-// state and each still runs on its own thread.
+// The modules share no state apart from the log, and each still runs on its
+// own thread.
+//
+// The log: one file per launch, LEMP\logs\lemp_<date>_<time>_<pid>_<tick>.txt,
+// every module's lines in it, each tagged with the module's name. Each
+// module's L() forwards to LempLogV. At start the folder keeps the newest
+// ten of these files and drops the per-module files earlier releases wrote.
 //
 // Debug mode is on unless Documents\BioWare\Mass Effect Legendary Edition\LEMP\nodebug.txt
 // exists (any content) — on by default; it used to be opt-in
-// through LEMP\debug.txt. With nodebug.txt only crash_log writes, and only
+// through LEMP\debug.txt. The options' log row writes and removes the same
+// file (LempSetLogOn). With nodebug.txt only crash_log writes, and only
 // when something faults; the diagnostics (repl_probe, loadmap_hook) do not run.
 // Logs go to LEMP\logs\, not beside the exe as the separate ASIs' did: a game
 // under Program Files runs unelevated and should not be able to write there
 // [R, not seen: no Windows player has sent logs yet].
 #pragma once
 #include <windows.h>
+#include <cstdarg>
 #include <cstdio>
 #include <string>
 
@@ -23,12 +29,30 @@
 const std::wstring& LempDir();
 // LempDir()\logs, created on first use.
 const std::wstring& LempLogDir();
-// LempDir()\nodebug.txt does not exist. Read once.
+// LempDir()\nodebug.txt did not exist at launch. Read once: it decides
+// whether the diagnostics modules run at all.
 bool LempDebug();
-// A new log file in LempLogDir() named <name>_<pid>_<tick>.txt (pids repeat
-// across Wine prefixes, so two instances on one machine need the tick too).
-// nullptr when debug mode is off, or when it cannot be opened.
-FILE* LempOpenDebugLog(const char* name);
+// Whether lines go into the log now: LempDebug() at launch, then whatever
+// the options row last set.
+bool LempLogOn();
+// The options row: saves the choice (nodebug.txt) for the next launch and
+// starts or stops this launch's lines at once. False when the file could not
+// be written or removed.
+bool LempSetLogOn(bool on);
+// One line, "hh:mm:ss.mmm  <module>  <text>", into the log when it is on.
+void LempLogV(const char* module, const char* fmt, va_list a);
+void LempLog(const char* module, const char* fmt, ...);
+// crash_log's two halves, for its exception handler: format a line into
+// buf (never allocates; truncates to fit; returns its length), and write a
+// formatted line, with force also when the log is off (a crash report) and
+// retrying a failed open at once. False when the line did not reach the
+// file whole.
+size_t LempLogFormatV(char* buf, size_t cap, const char* module, const char* fmt, va_list a);
+bool LempLogWriteLine(const char* line, size_t len, bool force);
+// The log file is open (not only switched on).
+bool LempLogIsOpen();
+// Keeps the newest sessions' files in LempLogDir(); Boot calls it once.
+void LempLogPrune();
 
 void CrashLogStart();       // always: says where the game died
 void CrashLogExit(bool processExit);  // DLL_PROCESS_DETACH: a clean exit says so
@@ -37,7 +61,9 @@ void MpMenuStart();         // the main menu's Multiplayer entry loads its scree
 void MpSaveStart();         // MP records, server, NAT, build key (mp_save)
 void NoFocusPauseStart();   // the host does not pause on alt-tab
 void OnlineApiStart();      // the ONLINE_API stand-in (challenge clock)
+void ShieldRegenStart();    // shields regenerate at their rate at any fps; LEMP\noshieldfix.txt = off
 void VoiceStart();          // voice chat (lemp_voice.cpp); LEMP\novoice.txt = off
+void GuiSoundProbeStart();  // debug: logs every PlayGuiSound / StopGuiSound (gui_sound_probe.cpp)
 // The voice options' ops (60-71), reached from script through mp_save's
 // SaveConfig hook (SFXGUI_Option_MPVoice*). Game thread. Returns AsiResult:
 // 0 done, -1 voice is off, 6 unknown op; *index is AsiIndex (in and out).

@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 CXX=${CXX:-x86_64-w64-mingw32-g++}
-LEMP_MODULES=(lemp crash_log join_patch loadmap_hook mp_menu mp_save nofocuspause online_api repl_probe lemp_voice lemp_voice_audio)
+LEMP_MODULES=(lemp crash_log join_patch loadmap_hook mp_menu mp_save nofocuspause online_api repl_probe lemp_voice lemp_voice_audio shield_regen gui_sound_probe)
 FLAGS=(-O2 -std=c++17 -municode -Wall -Wno-unused-parameter)
 # No build machine's paths in the binary (__FILE__ in asserts and logs): they
 # named the build machine's paths. libopus.a is built the same

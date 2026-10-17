@@ -504,8 +504,9 @@ static const char* kRedirectorHost = "gosredirector.ea.com";
 static const uint16_t kRedirectorPort = 42127;
 
 // Redirector GetServerInstance, as 2012's client sent it
-// (Pocket Relay's src/services/retriever/models.rs InstanceRequest).
-inline Bytes InstanceRequest() {
+// (Pocket Relay's src/services/retriever/models.rs InstanceRequest); `service` is
+// the instance asked for: the PC client's own, or a console's (console_probe.h).
+inline Bytes InstanceRequest(const char* service = "masseffect-3-pc") {
     tdf::Writer w;
     w.TagStr("BSDK", "3.15.6.0");
     w.TagStr("BTIM", "Dec 21 2012 12:47:10");
@@ -517,7 +518,7 @@ inline Bytes InstanceRequest() {
     w.TagStr("ENV", "prod");
     w.TagUnionUnset("FPID");
     w.TagInt("LOC", 0x656e4e5a);   // "enNZ", Pocket Relay's LOCALE_NZ
-    w.TagStr("NAME", "masseffect-3-pc");
+    w.TagStr("NAME", service);
     w.TagStr("PLAT", "Windows");
     w.TagStr("PROF", "standardSecure_v3");
     return w.b;

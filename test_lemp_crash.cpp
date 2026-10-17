@@ -6,9 +6,9 @@
 //   WINEPREFIX=<scratch> wine test_lemp_crash.exe quiet|crash|exiting
 //
 // quiet:   300 debug strings, then a clean exit. With LEMP\nodebug.txt the
-//          logs folder must stay empty; without it (the default),
-//          crash_log_*.txt exists from the start.
-// crash:   the same, then a write to address 8. A crash_log_*.txt must
+//          logs folder must stay empty; without it (the default), the
+//          session's lemp_*.txt exists from the start, crash_log's lines in it.
+// crash:   the same, then a write to address 8. A lemp_*.txt must
 //          appear either way, holding the last 200 debug strings and the
 //          report.
 // exiting: lemp::Exiting() / SetDetaching() (lemp.h) — the shared check
@@ -33,6 +33,7 @@ void OnlineApiStart() {}
 void VoiceStart() {}
 void LoadMapHookStart() {}
 void ReplProbeStart() {}
+void ShieldRegenStart() {}
 
 static int RunExitingTest() {
     int fail = 0;

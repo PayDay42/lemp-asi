@@ -3,7 +3,9 @@
 // NOT A PROBE. THIS ASI WRITES TO GAME MEMORY, like mp_save and join_patch:
 // one UFunction::Func pointer, SFXGUI_MainMenu_RTT.CallListFnc's (native), and
 // the Multiplayer entry's FncOnSelect text in the live menu's ListEntries
-// (ShowDemoLoginPopup -> ShowGameManual, in place; RewriteSelect).
+// (ShowDemoLoginPopup -> ShowGameManual, in place; RewriteSelect). It also
+// calls one script function per new main menu (AnnounceMenu), which sends a
+// player whose MP connection was lost on to the Multiplayer page.
 // In debug mode it writes one log of its own, mp_menu_<pid>_<tick>.txt in
 // Documents\BioWare\Mass Effect Legendary Edition\LEMP\logs (lemp.h).
 //
@@ -76,7 +78,6 @@ static uint8_t*     g_base = nullptr;
 static uint8_t*     g_end  = nullptr;
 static FNameEntry** g_pools = nullptr;
 static TArray<UObject*>* g_objs = nullptr;
-static FILE*        g_log = nullptr;
 static ExecFn       g_origCallListFnc = nullptr;
 static UObject*     g_initGuiFn = nullptr;       // SFXGUIInteraction.InitializeStartupGuiForPlayer
 static UObject*     g_loaderHud = nullptr;       // Class'Engine.DebugCameraHUD'
@@ -84,13 +85,8 @@ static UObject*     g_target = nullptr;          // SFXGUI_MainMenu_RTT.CallList
 static UObject*     g_validatePcFn = nullptr;    // SFXGUIInteraction.ValidatePlayerController
 
 static void L(const char* fmt, ...) {
-    if (!g_log) return;
-    SYSTEMTIME st; GetLocalTime(&st);
     va_list a; va_start(a, fmt);
-    fprintf(g_log, "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    vfprintf(g_log, fmt, a);
-    fputc('\n', g_log);
-    fflush(g_log);
+    LempLogV("mp_menu", fmt, a);
     va_end(a);
 }
 static const char* NameOf(const FName& n) {
@@ -251,6 +247,39 @@ static void RewriteSelect(UObject* menu) {
     }
 }
 
+// A connection that dies after its map has loaded is not reported to script
+// outside a Blaze game: the engine travels to the default map (UE3's ?closed),
+// and LE3's SFXGameViewportClient.NotifyConnectionError only records the error
+// in SFXEngine.sLastNetworkError. So, once per main-menu instance, call
+// SFXGUI_MPMainMenuEntry.LEMPMainMenuShown() — static, no parameters — on the
+// class's default object; the script decides from that record whether to go on
+// to the Multiplayer page and say so. On the game thread, inside the hook.
+// Once, not on every call: the main menu's own Join watches the same record
+// while its menu stays up. Keyed on the address and the GObjects index, so a
+// new menu allocated where a collected one was is still seen as new.
+static UObject* g_shownMenu = nullptr;   // the menu instance last announced
+static int32_t  g_shownIndex = -1;
+static void AnnounceMenu(UObject* menu) {
+    if (menu == g_shownMenu && menu->InternalIndex == g_shownIndex) return;
+    g_shownMenu = menu;
+    g_shownIndex = menu->InternalIndex;
+    UObject* fn = nullptr;
+    UObject* cdo = nullptr;
+    for (int i = 0; i < g_objs->Count && (!fn || !cdo); ++i) {
+        UObject* o = g_objs->Data[i];
+        if (!o || !o->Class) continue;
+        if (!fn && o->Outer == g_cls && _stricmp(NameOf(o->Class->Name), "Function") == 0 && _stricmp(NameOf(o->Name), "LEMPMainMenuShown") == 0) fn = o;
+        if (!cdo && o->Class == g_cls && IsDefault(o)) cdo = o;
+    }
+    if (!fn || !cdo) { L("menu %p: SFXGUI_MPMainMenuEntry.LEMPMainMenuShown %s (an older MPMainMenu.pcc?): not called", (void*)menu, fn ? "has no default object" : "not found"); return; }
+    void** vt = *(void***)cdo;
+    void* pe = vt ? vt[VT_PROCESSEVENT / 8] : nullptr;
+    if (!pe || !InExe(pe)) { L("menu %p: no ProcessEvent on the default object: LEMPMainMenuShown not called", (void*)menu); return; }
+    alignas(16) uint8_t parms[64] = {0};   // its locals' frame is the script's own
+    ((ProcessEventFn)pe)(cdo, fn, parms, nullptr);
+    L("menu %p: LEMPMainMenuShown called", (void*)menu);
+}
+
 static DWORD g_lastTry = 0;
 static int   g_tries = 0;
 
@@ -294,6 +323,7 @@ static void HookCallListFnc(UObject* self, void* stack, void* result) {
         }
     }
     if (self) RewriteSelect(self);
+    if (self && ClassStillThere()) AnnounceMenu(self);
     g_origCallListFnc(self, stack, result);
 }
 
@@ -328,7 +358,6 @@ static bool Install() {
 // Thread() does it, and hooks again whenever the game re-binds it.
 
 static DWORD WINAPI Thread(LPVOID) {
-    g_log = LempOpenDebugLog("mp_menu");
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
     uint32_t peOff = *(uint32_t*)(g_base + 0x3C);

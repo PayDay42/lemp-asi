@@ -98,9 +98,11 @@ struct State {
     DWORD leaseAt = 0, lastPut = 0;
     DWORD leaseExtraMs = 0;      // a migration's new host: its map loads before script renews
     int reachable = -1;          // -1 unknown, 1, 0 (a join failed to reach it)
+    std::string hostRefused;     // the server's 426 message for the lobby it refused (29/30)
     HANDLE hostThread = nullptr;
     std::string punchSent;       // the proxy fields the server last heard (WithPunch)
     std::string menuSession;     // Session(): this launch, on the Multiplayer page's count
+    volatile LONG failedReports = 0;   // JoinFailedThread posts in flight (SearchThread waits)
 };
 static State g;
 
@@ -290,6 +292,16 @@ static std::string PunchToHost(const std::string& lobby, const std::string& toke
     punch::JoinStop(id);
     if (SearchCurrent(gen)) Log("online: punch: no connection to the host's proxy; trying its address directly");
     return "";
+}
+
+// The game's net driver is IPv4 only, and its URL parser takes the "2a09:" of
+// an IPv6 address for a protocol and hands the whole URL to the shell (a
+// Windows "no program to open this" box). Only "a.b.c.d:port" goes to it.
+static bool GameCanOpen(const std::string& address) {
+    size_t colon = address.rfind(':');
+    if (colon == std::string::npos) return false;
+    in_addr a;
+    return inet_pton(AF_INET, address.substr(0, colon).c_str(), &a) == 1;
 }
 
 // ---- the search ----------------------------------------------------------------
@@ -501,6 +513,11 @@ static int Migrate(const SearchArgs& a, const std::string& build, std::string& t
                 if (!SearchCurrent(a.gen)) return FAILED;
                 if (!via.empty()) address = via;
             }
+            if (!GameCanOpen(address)) {
+                Log("online: migration: the new host's address %s is not IPv4", address.c_str());
+                text = Opt("message", "The new host cannot be reached.");
+                return FAILED;
+            }
             Log("online: migration: the new host of lobby %s is up; joining", f.Str("lobby").c_str());
             EnterCriticalSection(&g.cs);
             if (g.searchGen == a.gen) g.joinLobby = f.Str("lobby");
@@ -517,6 +534,10 @@ static int Migrate(const SearchArgs& a, const std::string& build, std::string& t
 static DWORD WINAPI SearchThread(LPVOID p) {
     SearchArgs a = *(SearchArgs*)p;
     delete (SearchArgs*)p;
+    // Script reports a failed join and searches again at once (2012's
+    // OnQuickMatchJoined). Ahead of its report, the search was matched to
+    // the same lobby, which the report would have taken out of matching.
+    for (int t = 0; t < 5000 && g.failedReports > 0; t += 50) Sleep(50);
     std::string build = Build();
     if (!a.mig.lobby.empty()) {
         std::string text = build.empty() ? Opt("message", "this install has no build identity (debug log)") : "";
@@ -605,7 +626,13 @@ static DWORD WINAPI SearchThread(LPVOID p) {
                     if (!SearchCurrent(a.gen)) break;
                     if (!via.empty()) address = via;
                 }
-                text = Opt("address", address) + Opt("lobby", f.Str("lobby"));
+                if (GameCanOpen(address)) {
+                    text = Opt("address", address) + Opt("lobby", f.Str("lobby"));
+                } else {
+                    Log("online: search: the host's address %s is not IPv4", address.c_str());
+                    outcome = FAILED;
+                    text = Opt("message", "The host cannot be reached.");
+                }
             } else if (o == CREATE) {
                 text = Opt("map", f.Int("map", 0)) + Opt("enemy", f.Int("enemy", 0)) + Opt("difficulty", f.Int("difficulty", 0));
             } else {
@@ -615,7 +642,7 @@ static DWORD WINAPI SearchThread(LPVOID p) {
             EnterCriticalSection(&g.cs);
             if (g.searchGen == a.gen) {
                 g.ticket = ticket;
-                if (o == JOIN) g.joinLobby = f.Str("lobby");
+                if (outcome == JOIN) g.joinLobby = f.Str("lobby");
                 if (o == CREATE) g.createTicket = ticket;
             }
             LeaveCriticalSection(&g.cs);
@@ -852,9 +879,13 @@ static DWORD WINAPI HostThread(LPVOID) {
                     Log("online: lobby %s refused by the server", id.c_str());
                     g.hosting = false;
                 }
-                if (answered && status == 426) {   // this release is below the server's minimum
+                if (answered && status == 426) {   // not the release the server requires
                     Log("online: lobby %s not registered: %s", id.c_str(), f.Str("message").c_str());
                     g.hosting = false;
+                    // Shown in the lobby (29/30): without it, the host sat in a
+                    // lobby with no code that nobody could find, and only the
+                    // log said why.
+                    g.hostRefused = f.Str("message").empty() ? "The LEMP server refused this lobby." : f.Str("message");
                 }
                 if (!g.hosting) { LeaveCriticalSection(&g.cs); punch::HostStop(); EnterCriticalSection(&g.cs); }
             }
@@ -1319,6 +1350,7 @@ static int StartSearch(const std::string& opts) {
     g.ticket.clear();
     g.joinLobby.clear();
     g.rules = r;
+    g.hostRefused.clear();   // asked again: a lobby this search creates registers anew
     LeaveCriticalSection(&g.cs);
     HANDLE t = CreateThread(nullptr, 0, SearchThread, new SearchArgs{gen, r, code, mig}, 0, nullptr);
     if (!t) return 2;
@@ -1360,6 +1392,7 @@ static DWORD WINAPI JoinFailedThread(LPVOID p) {
     int status = 0; std::string resp;
     Http(L"POST", "/v1/lobbies/" + lobby + "/failed", JsonObject().Str("ticket", ticket).Done(), "", status, resp);
     Log("online: reported a failed join to lobby %s (HTTP %s)", lobby.c_str(), std::to_string(status).c_str());
+    InterlockedDecrement(&g.failedReports);
     return 0;
 }
 static int ReportJoinFailed() {
@@ -1371,8 +1404,10 @@ static int ReportJoinFailed() {
     LeaveCriticalSection(&g.cs);
     if (pj) punch::JoinStop(pj);
     if (lobby.empty()) return 7;
+    InterlockedIncrement(&g.failedReports);
     HANDLE t = CreateThread(nullptr, 0, JoinFailedThread, new std::string(lobby + "|" + ticket), 0, nullptr);
     if (t) CloseHandle(t);
+    else InterlockedDecrement(&g.failedReports);
     return 0;
 }
 
@@ -1447,6 +1482,7 @@ static int UpdateLobby(const std::string& opts) {
         g.createTicket.clear();
         g.hosting = true;
         g.reachable = -1;
+        g.hostRefused.clear();
         g.lobbyOpts.clear();
     }
     for (auto& kv : given) g.lobbyOpts[kv.first] = kv.second;
@@ -1505,11 +1541,15 @@ static std::string HostQuality() {
     if (nat.empty()) nat = punch::GetHostInfo().nat;
     return Opt("nat", nat) + Opt("upnp", (long long)(upnp::Usable() ? 1 : 0));
 }
-// 29/30: the hosted lobby's status: ?code= ?reachable= (-1 unknown, 1, 0).
+// 29/30: the hosted lobby's status: ?code= ?reachable= (-1 unknown, 1, 0);
+// not hosting, ?refused=<the server's message> if the server refused the
+// registration with 426 (not the release it requires), until the next search
+// or registration; else "".
 static std::string LobbyStatus(int& reachable) {
     EnterCriticalSection(&g.cs);
     reachable = g.hosting ? g.reachable : -1;
-    std::string s = g.hosting ? Opt("code", g.lobbyCode) + Opt("reachable", (long long)g.reachable) : "";
+    std::string s = g.hosting ? Opt("code", g.lobbyCode) + Opt("reachable", (long long)g.reachable)
+                  : !g.hostRefused.empty() ? Opt("refused", g.hostRefused) : "";
     LeaveCriticalSection(&g.cs);
     return s;
 }

@@ -13,7 +13,7 @@
 // lemp.cpp's helpers, for this test. This test does not exercise Install()/
 // Thread(), so a null GNatives and "never exiting" are both fine stand-ins.
 const std::wstring& LempDir() { static std::wstring d = L"."; return d; }
-FILE* LempOpenDebugLog(const char*) { return stdout; }
+void LempLogV(const char* module, const char* fmt, va_list a) { printf("%s  ", module); vprintf(fmt, a); printf("\n"); }
 void** LempGNatives() { return nullptr; }
 namespace lemp { bool Exiting() { return false; } }
 
@@ -49,7 +49,6 @@ static int HookRecv(SOCKET s, char* buf, int cap, sockaddr_in* from) {
 
 int main() {
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
-    g_log = stdout;
     InitializeCriticalSection(&g_cs);
     g_realRecvFrom = (RecvFromFn)&recvfrom;
     g_realSendTo = (SendToFn)&sendto;

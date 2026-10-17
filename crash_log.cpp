@@ -19,12 +19,12 @@
 // header, and — at the moment of a crash only — the objects the registers
 // point at, to name them. It writes nothing into the game.
 //
-// Part of lemp.asi, and the one module that always writes (lemp.h). In debug
-// mode its file is opened at start, as it always was. Otherwise nothing is
-// written until a crash is reported: the lines before it (the game's debug
-// strings, non-fatal exceptions) are kept in memory, the last RING_LINES of
-// them, and go into the file ahead of the report. A run that does not fault
-// leaves no file.
+// Part of lemp.asi, and the one module that always writes (lemp.h). With the
+// log on, its lines go into the session's log as they come. With it off,
+// nothing is written until a crash is reported: the lines before it (the
+// game's debug strings, non-fatal exceptions) are kept in memory, the last
+// RING_LINES of them, and go into the log ahead of the report. A run that
+// does not fault leaves no file.
 //
 // Build: ./build.sh   (lemp.asi)
 #include <windows.h>
@@ -35,56 +35,59 @@
 #include <cstring>
 #include <cstdarg>
 
-static FILE*    g_log   = nullptr;
 static uint8_t* g_base  = nullptr;
 static uint8_t* g_end   = nullptr;
 static int      g_fired = 0;
 static int      g_other = 0;   // non-fatal first-chance lines written (capped)
+static volatile bool g_forced = false;   // a crash report is being written with the log off
 
-// Where the files go, fixed at start so a crash computes nothing: the
-// LEMP\logs folder and this process's crash_log_<pid>_<tick>.txt in it.
+// Where the memory snapshots go, fixed at start so a crash computes nothing:
+// the LEMP\logs folder. The lines go into the session's log (lemp.h).
 static wchar_t  g_logDir[MAX_PATH];
-static wchar_t  g_logPath[MAX_PATH];
 
-// Outside debug mode, the lines before a crash. Slots are claimed with an
+// With the log off, the lines before a crash. Slots are claimed with an
 // interlocked counter, not a lock: L() runs inside the exception handler, on
 // whatever thread faulted.
 static const int  RING_LINES = 200;
 static char       g_ring[RING_LINES][256];
 static volatile LONG g_ringNext = 0;
 
+// Each line is written as it comes (one WriteFile, nothing buffered): the
+// process is about to die. Formatting never allocates.
 static void L(const char* fmt, ...)
 {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
     va_list ap;
     va_start(ap, fmt);
-    if (g_log) {
-        fprintf(g_log, "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_log, fmt, ap);
-        fputc('\n', g_log);
-        fflush(g_log);   // flush EVERY line: the process is about to die
-    } else {
-        char* line = g_ring[(InterlockedIncrement(&g_ringNext) - 1) % RING_LINES];
-        int n = snprintf(line, 256, "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vsnprintf(line + n, 256 - n, fmt, ap);
-    }
+    char line[1024];
+    size_t n = LempLogFormatV(line, sizeof line, "crash_log", fmt, ap);
     va_end(ap);
+    // Not written (log off, its file could not be opened or written): kept
+    // for a crash report. The open is forced only for the report itself;
+    // the session's lines keep the retry interval like every module's.
+    if (!((LempLogOn() || g_forced) && LempLogWriteLine(line, n, g_forced))) {
+        char* slot = g_ring[(InterlockedIncrement(&g_ringNext) - 1) % RING_LINES];
+        size_t k = n < 255 ? n : 255;
+        memcpy(slot, line, k);
+        slot[k] = 0;
+    }
 }
 
-// The file, opened at the first crash report when it is not open already
-// (debug mode opens it at start), with the remembered lines first.
+// With the log off (or its file not open), the first crash report writes
+// into it anyway, the remembered lines first.
 static void OpenForCrash()
 {
-    if (g_log || !g_logPath[0]) return;
-    g_log = _wfopen(g_logPath, L"w");
-    if (!g_log) return;
+    if (g_forced || (LempLogOn() && LempLogIsOpen())) return;
+    g_forced = true;
     const LONG next = g_ringNext;
     const LONG first = next > RING_LINES ? next - RING_LINES : 0;
-    fprintf(g_log, "== crash_log ==  pid %lu  (no debug mode: the %ld lines before the crash, then the report)\n",
-            (unsigned long)GetCurrentProcessId(), (long)(next - first));
-    for (LONG i = first; i < next; i++) fprintf(g_log, "%s\n", g_ring[i % RING_LINES]);
-    fflush(g_log);
+    char head[160];
+    int n = snprintf(head, sizeof head, "== crash_log ==  pid %lu  (log off: the %ld lines before the crash, then the report)",
+                     (unsigned long)GetCurrentProcessId(), (long)(next - first));
+    if (n > 0) LempLogWriteLine(head, (size_t)n < sizeof head ? (size_t)n : sizeof head - 1, true);
+    for (LONG i = first; i < next; i++) {
+        const char* line = g_ring[i % RING_LINES];
+        LempLogWriteLine(line, strnlen(line, 256), true);
+    }
 }
 
 // Which module an address belongs to, and its offset within it.
@@ -609,10 +612,6 @@ static DWORD WINAPI Init(LPVOID)
     const std::wstring& dir = LempLogDir();
     _snwprintf(g_logDir, MAX_PATH, L"%ls", dir.c_str());
     g_logDir[MAX_PATH - 1] = 0;
-    _snwprintf(g_logPath, MAX_PATH, L"%ls\\crash_log_%lu_%lu.txt", g_logDir,
-               (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
-    g_logPath[MAX_PATH - 1] = 0;
-    if (LempDebug()) g_log = _wfopen(g_logPath, L"w");
 
     g_base = (uint8_t*)GetModuleHandleA("MassEffect3.exe");
     if (!g_base) g_base = (uint8_t*)GetModuleHandleA(nullptr);
@@ -644,5 +643,5 @@ void CrashLogStart()
 // Only into a file already open: a clean exit is no reason to start one.
 void CrashLogExit(bool processExit)
 {
-    if (g_log) L("process exiting (DLL_PROCESS_DETACH, %s)", processExit ? "ExitProcess" : "FreeLibrary");
+    if (LempLogOn() || g_forced) L("process exiting (DLL_PROCESS_DETACH, %s)", processExit ? "ExitProcess" : "FreeLibrary");
 }

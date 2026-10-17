@@ -53,6 +53,47 @@ int wmain_or_main(int argc, wchar_t** wargv) {
     check("join options, none/unknown",
           buildkey::JoinOptions("abc", "", "11", "22", "") ==
               "LEMPBuild=abc?LEMPGame=unknown?LEMPAsi=11?LEMPBase=22?LEMPMods=none");
+    {
+        // The plain base files hash to a plain install's LEMPBase, and are the
+        // files LEMPBase hashes.
+        std::vector<buildkey::Entry> plain;
+        std::vector<std::pair<std::string, const buildkey::Entry*>> files;
+        for (const auto& x : buildkey::kBaseExpected) plain.push_back({x.rel, x.size, x.sha});
+        for (const auto& e : plain) files.push_back({e.rel, &e});
+        check("kBaseExpected hashes to LEMPBase 59ba2c5b", buildkey::ListHash(files) == "59ba2c5b");
+        bool listed = sizeof buildkey::kBaseFiles / sizeof *buildkey::kBaseFiles == plain.size();
+        for (const char* rel : buildkey::kBaseFiles) {
+            bool found = false;
+            for (const auto& e : plain) found = found || e.rel == rel;
+            listed = listed && found;
+        }
+        check("kBaseExpected names kBaseFiles", listed);
+        check("plain base files: none different", buildkey::DifferentBaseFiles(plain) == "");
+        auto changed = plain;
+        changed[7].sha = std::string(64, '0');   // sfxgame.pcc
+        changed[0].sha.clear();                  // coalesced.bin missing
+        check("changed and missing base files named", buildkey::DifferentBaseFiles(changed) == "Coalesced.bin,SFXGame.pcc");
+    }
+    {
+        check("mods notice: plain install, none", buildkey::ModsNotice("", "") == "");
+        // A player's real install (other mods and a changed SFXGame.pcc).
+        std::string n = buildkey::ModsNotice("DLC_MOD_C5_UWU,DLC_MOD_JournalEnhanced,DLC_MOD_LE3shieldGate,DLC_MOD_REAPERNOPENALTY",
+                                             "SFXGame.pcc");
+        size_t nl = n.find('\n');
+        printf("    %s\n", n.c_str());
+        check("mods notice: two lines, each fits the box",
+              nl != std::string::npos && nl <= buildkey::kNoticeLine && n.size() - nl - 1 <= buildkey::kNoticeLine);
+        check("mods notice: shortened with +N more, base file kept",
+              n.find("+") != std::string::npos && n.find("Changed: SFXGame.pcc") != std::string::npos);
+        check("mods notice: mods only",
+              buildkey::ModsNotice("DLC_MOD_A,DLC_MOD_B", "") ==
+                  "Matchmaking only finds players with the same other mods as you:\nMods: A, B");
+        check("mods notice: base files only",
+              buildkey::ModsNotice("", "Coalesced.bin") ==
+                  "Matchmaking only finds players with the same changed game files:\nChanged: Coalesced.bin");
+        std::string many = buildkey::ModsNotice("", "Coalesced.bin,Core.pcc,Engine.pcc,GameFramework.pcc,GFxUI.pcc,IpDrv.pcc,SFXGame.pcc");
+        check("mods notice: long base list fits", many.size() - many.find('\n') - 1 <= buildkey::kNoticeLine);
+    }
 #ifdef _WIN32
     // argv: <DLC folder> <cache> [<Game\ME3 folder>: also the join options,
     // the exe version read from MassEffect3.exe's file as lemp_buildkey.py does]
